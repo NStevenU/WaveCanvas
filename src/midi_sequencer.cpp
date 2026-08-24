@@ -722,7 +722,7 @@ void MIDISequencer::processNextEvents() {
 
     if (allDone) {
         if (loopEnabled && numTracks > 0) {
-            // 무한 루프: 트랙 포인터들을 처음으로 리셋
+            // 무한 루프: 트랙 포인터 리셋
             for (uint16_t t = 0; t < numTracks; t++) {
                 tracks[t].current = tracks[t].start;
                 tracks[t].runningStatus = 0;
@@ -739,35 +739,14 @@ void MIDISequencer::processNextEvents() {
             }
             currentTick = 0;
         } else {
-            // [3초 자연 잔향 대기 + 마지막 1초 안전 페이드아웃]
-            static uint32_t tailStartTime = 0;
-            static bool waitingForTail = false;
-            static uint8_t initialVolume = 100;
-
-            if (!waitingForTail) {
-                waitingForTail = true;
-                tailStartTime = millis();
-                initialVolume = AudioEngine::getMasterVolume(); // 사용자 설정 볼륨 백업
+            // [실기 표준 정지 방식]
+            // 모든 채널에 댐퍼 페달 해제 및 All Notes Off 전송 (박수/루프 노트 자연 감쇠)
+            for (uint8_t ch = 0; ch < 16; ch++) {
+                AudioEngine::controlChangeDirect(ch, 64, 0);   // Sustain Off
+                AudioEngine::controlChangeDirect(ch, 123, 0);  // All Notes Off
             }
 
-            uint32_t elapsed = millis() - tailStartTime;
-
-            // 1. 처음 3초 동안은 아무런 볼륨 조작 없이 순수 잔향 유지
-            if (elapsed < 3000) {
-                return;
-            }
-
-            // 2. 3초 ~ 4초 구간: 잔향이 여전히 길게 남아있다면 부드럽게 1초간 페이드아웃
-            if (elapsed < 4000) {
-                float fadeRatio = (4000.0f - (float)elapsed) / 1000.0f; // 1.0 -> 0.0
-                AudioEngine::setMasterVolumeDirect((uint8_t)(fadeRatio * (float)initialVolume));
-                return;
-            }
-
-            // 3. 4초 경과: 원래 볼륨으로 즉시 원복 후 안전 리셋
-            waitingForTail = false;
-            tailStartTime = 0;
-            AudioEngine::setMasterVolumeDirect(initialVolume); // 다음 곡을 위해 볼륨 복구
+            // 시퀀서 즉시 정지 (UI 볼륨/NVS 플래시 건드리지 않음)
             stopInternal();
         }
     }
