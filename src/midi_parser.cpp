@@ -306,8 +306,12 @@ const char *MIDIParser::getSynthModeString() {
 
 static void serialMidiTask(void* pv) {
     while (true) {
-        // 데이터 유무와 상관없이 update()를 실행하여 시리얼 수신, 2초 무신호 GM 복구, VU 감쇠를 동시 처리
-        MIDIParser::update();
+        // 하드웨어 FIFO에 데이터가 있으면 쉬지 않고 즉시 전량 처리
+        while (SerialMIDI.available() > 0) {
+          uint8_t b = SerialMIDI.read();
+          MIDIParser::parseByte(b);
+        }
+        MIDIParser::update(); // 무신호 감지 및 VU 미터 처리
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
@@ -462,7 +466,7 @@ void MIDIParser::processCompleteMessage() {
   case 0xC0: { // Program Change (악기 변경)
     uint8_t prog = msgBuffer[1];
     channels[channel].program = prog;
-    AudioEngine::programChange(channel, prog);
+    AudioEngine::programChangeDirect(channel, prog); // [수정] Mutex 타임아웃 없는 Direct 호출
     lastActiveChannel = channel;
     break;
   }
@@ -478,18 +482,26 @@ void MIDIParser::processCompleteMessage() {
           MIDIParser::setSynthMode(SYNTH_MODE_GS);
         }
       } else {
+        /* [옵션: SysEx 없는 비표준 MT-32 파일 지원용 다중 채널 감지 로직]
+        // 멜로디 채널 3개 이상에서 Bank 127을 동시 요청할 때만 MT-32 모드로 전환
+        static uint16_t mt32BankMask = 0;
         if (val == 127) {
-          // Bank 127 수신 시 MT-32 모드
-          MIDIParser::setSynthMode(SYNTH_MODE_MT32);
-          AudioEngine::applyMT32ModeDirect();
-        } else if (val > 0) {
-          // Bank 1~126 수신 시 GS 모드 및 해당 뱅크 지정
-          MIDIParser::setSynthMode(SYNTH_MODE_GS);
-          AudioEngine::setBank(channel, val);
+          mt32BankMask |= (1 << channel);
+          if (__builtin_popcount(mt32BankMask) >= 3 && g_synth_mode != SYNTH_MODE_MT32) {
+            MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+            AudioEngine::applyMT32ModeDirect();
+          }
         } else {
-          // [수정] val == 0: MT-32/GS 모드를 해제하지 않고 해당 채널 뱅크만 0으로 변경
-          AudioEngine::setBank(channel, 0);
+          mt32BankMask &= ~(1 << channel);
         }
+        */
+
+        // [기본 표준 동작] 
+        // 전체 시스템 모드를 뒤집지 않고, GS 모드를 유지한 채 해당 채널의 사운드폰트 Bank만 지정
+        if (val > 0 && g_synth_mode != SYNTH_MODE_MT32) {
+          MIDIParser::setSynthMode(SYNTH_MODE_GS);
+        }
+        AudioEngine::setBankDirect(channel, val);
       }
     }
 
@@ -633,11 +645,6 @@ void MIDIParser::parseSysExByte(uint8_t b) {
       if (b == 0xF7) {
         sysexBuf[sysexLen++] = b;
       }
-
-      // [핵심] 시리얼로 실제 도착한 SysEx 바이트를 시리얼 모니터로 즉시 출력
-      Serial.printf("[RX SysEx %d B] ", sysexLen);
-      for (int i = 0; i < sysexLen && i < 12; i++) Serial.printf("%02X ", sysexBuf[i]);
-      Serial.println();
 
       // SysEx 분석
       if (sysexLen >= 20 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
