@@ -296,6 +296,7 @@ WaveCanvas/
 │   └── logo.png               # Web GUI 로고 이미지 리소스
 ├── icon/                      # Web UI 소스 아이콘 리소스 (.png)
 ├── generate_mt32_pcm.py       # MT-32 ROM -> C++ 소스코드 자동 디코더/생성기
+├── fix_roland_checksum.py     # MIDI 파일 내 Roland SysEx 체크섬 검증 및 자동 보정 스크립트
 ├── partitions_16MB.csv        # 16MB Flash 파티션 테이블 (LittleFS / App / OTA)
 ├── platformio.ini             # PlatformIO 빌드 설정 (-O3, -ffast-math, ESP32-S3)
 └── README.md                  # 프로젝트 문서

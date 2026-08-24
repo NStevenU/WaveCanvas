@@ -304,9 +304,17 @@ const char *MIDIParser::getSynthModeString() {
   }
 }
 
+static void serialMidiTask(void* pv) {
+    while (true) {
+        // 데이터 유무와 상관없이 update()를 실행하여 시리얼 수신, 2초 무신호 GM 복구, VU 감쇠를 동시 처리
+        MIDIParser::update();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
 void MIDIParser::begin(uint32_t baudRate) {
   currentBaud = baudRate;
-  SerialMIDI.setRxBufferSize(2048);
+  SerialMIDI.setRxBufferSize(4096);
   SerialMIDI.begin(currentBaud, SERIAL_8N1, PIN_MIDI_RX, PIN_MIDI_TX);
 
   // 채널 상태 초기화
@@ -320,6 +328,9 @@ void MIDIParser::begin(uint32_t baudRate) {
   }
   channels[9].program = 0; // Drum Kit
   lastMidiEventTime = 0;
+
+  // Core 0에서 화면/네트워크(1~2)보다 높은 우선순위 4로 생성
+  xTaskCreatePinnedToCore(serialMidiTask, "SerialMIDI", 4096, NULL, 4, NULL, 0);
 }
 
 bool MIDIParser::isMIDIActive() {
@@ -458,44 +469,43 @@ void MIDIParser::processCompleteMessage() {
   case 0xB0: { // Control Change
     uint8_t ctrl = msgBuffer[1];
     uint8_t val = msgBuffer[2];
-    if (ctrl == 0) { // Bank Select MSB
-      // 10번 드럼 채널(channel == 9)은 제외하고 멜로디 채널만 모드 판정
-      if (channel != 9) {
-        // [수정] Bank 127을 포함한 모든 뱅크 변경(val > 0)은 GS 모드로 판정
-        if (val > 0) {
-          if (g_synth_mode != SYNTH_MODE_GS && g_synth_mode != SYNTH_MODE_MT32) {
-            g_synth_mode = SYNTH_MODE_GS;
-            SemaphoreHandle_t mutex = AudioEngine::getMutex();
-            if (mutex)
-              xSemaphoreTake(mutex, pdMS_TO_TICKS(50));
-            AudioEngine::applyGSModeDirect();
-            if (mutex)
-              xSemaphoreGive(mutex);
-          }
+    
+    // Bank Select MSB (CC 0)
+    if (ctrl == 0) {
+      if (channel == 9) {
+        // 드럼 채널 CC 0 = 127 (GS CM-64/32 Kit)
+        if (val == 127 && g_synth_mode != SYNTH_MODE_MT32) {
+          MIDIParser::setSynthMode(SYNTH_MODE_GS);
         }
-      } // <- if (channel != 9) 닫기
-    }   // <- if (ctrl == 0) 닫기
-
-    if (ctrl == 7)
-      channels[channel].volume = val;
-    if (ctrl == 11)
-      channels[channel].expression = val;
-
-    // RPN 등록
-    if (ctrl == 101)
-      channelRPN[channel] =
-          (channelRPN[channel] & 0x007F) | ((uint16_t)val << 7);
-    if (ctrl == 100)
-      channelRPN[channel] =
-          (channelRPN[channel] & 0x3F80) | (val & 0x7F);
-
-    // NRPN 수신 시 RPN 즉시 무효화 (Null RPN)
-    if (ctrl == 99 || ctrl == 98) {
-      channelRPN[channel] = 0x7F7F;
+      } else {
+        if (val == 127) {
+          // Bank 127 수신 시 MT-32 모드
+          MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+          AudioEngine::applyMT32ModeDirect();
+        } else if (val > 0) {
+          // Bank 1~126 수신 시 GS 모드 및 해당 뱅크 지정
+          MIDIParser::setSynthMode(SYNTH_MODE_GS);
+          AudioEngine::setBank(channel, val);
+        } else {
+          // [수정] val == 0: MT-32/GS 모드를 해제하지 않고 해당 채널 뱅크만 0으로 변경
+          AudioEngine::setBank(channel, 0);
+        }
+      }
     }
 
-    if (ctrl == 6) {
-      if (channelRPN[channel] == 0x0000) {
+    if (ctrl == 7) channels[channel].volume = val;
+    if (ctrl == 11) channels[channel].expression = val;
+
+    // RPN 등록
+    if (ctrl == 101) channelRPN[channel] = (channelRPN[channel] & 0x007F) | ((uint16_t)val << 7);
+    if (ctrl == 100) channelRPN[channel] = (channelRPN[channel] & 0x3F80) | (val & 0x7F);
+
+    if (ctrl == 99 || ctrl == 98) {
+      channelRPN[channel] = 0x7F7F; // NRPN 수신 시 RPN 무효화
+    }
+
+    if (ctrl == 6) { // Data Entry MSB
+      if (channelRPN[channel] == 0x0000) { // Pitch Bend Sensitivity (RPN 00 00)
         uint8_t range = (val > 24) ? 24 : val;
         AudioEngine::setPitchRange(channel, (float)range);
         channelRPN[channel] = 0x7F7F;
@@ -507,23 +517,17 @@ void MIDIParser::processCompleteMessage() {
     if (ctrl == 120 || ctrl == 123) {
       channels[channel].vuLevel = 0;
     }
-    if (ctrl == 126)
-      AudioEngine::setChannelMono(channel, true);
-    if (ctrl == 127)
-      AudioEngine::setChannelMono(channel, false);
+    if (ctrl == 126) AudioEngine::setChannelMono(channel, true);
+    if (ctrl == 127) AudioEngine::setChannelMono(channel, false);
     AudioEngine::controlChange(channel, ctrl, val);
     break;
   }
-  case 0xD0: { // Channel Pressure (Aftertouch)
-    uint8_t val = msgBuffer[1];
-    AudioEngine::controlChange(channel, 1,
-                               val / 2); // 모듈레이션에 부드럽게 반영
+  case 0xD0: { // Channel Pressure
+    AudioEngine::controlChange(channel, 1, msgBuffer[1] / 2);
     break;
   }
   case 0xA0: { // Polyphonic Aftertouch
-    uint8_t val = msgBuffer[2];
-    AudioEngine::controlChange(channel, 1,
-                               val / 2); // 모듈레이션에 부드럽게 반영
+    AudioEngine::controlChange(channel, 1, msgBuffer[2] / 2);
     break;
   }
   case 0xE0: { // Pitch Bend
@@ -558,12 +562,26 @@ void MIDIParser::parseByte(uint8_t b) {
     return;
   }
 
+  // 1. SysEx 수신 중이거나 0xF0가 들어온 경우
   if (inSysEx || b == 0xF0) {
     parseSysExByte(b);
+    // SysEx를 끝내면서 들어온 일반 상태 바이트(0x80~0xEF)는 아래로 내려보내 정상 처리하고,
+    // SysEx가 계속 진행 중이거나 F0/F7 바이트 자체인 경우에만 즉시 리턴
+    if (inSysEx || b == 0xF0 || b == 0xF7)
+      return;
+  }
+
+  // 2. F0 없이 들어오는 Roland Raw SysEx Escape (0x41 0x10 0x16 ...) 감지
+  if (msgIndex == 0 && runningStatus == 0 && b == 0x41) {
+    inSysEx = true;
+    sysexOverflow = false;
+    sysexLen = 0;
+    sysexBuf[sysexLen++] = b;
+    lastMidiEventTime = millis();
     return;
   }
 
-  // Status Byte (0x80 ~ 0xF7)
+  // 3. Status Byte (0x80 ~ 0xEF)
   if (b & 0x80) {
     runningStatus = b;
     msgBuffer[0] = b;
@@ -577,7 +595,7 @@ void MIDIParser::parseByte(uint8_t b) {
     return;
   }
 
-  // Data Byte (Running Status 지원)
+  // 4. Data Byte (Running Status 지원)
   if (msgIndex == 0 && runningStatus != 0) {
     msgBuffer[0] = runningStatus;
     msgIndex = 1;
@@ -601,23 +619,31 @@ void MIDIParser::parseSysExByte(uint8_t b) {
       sysexOverflow = false;
       sysexLen = 0;
       sysexBuf[sysexLen++] = b;
+      lastMidiEventTime = millis(); // SysEx 수신 시 타이머 갱신
     }
   } else {
-    if (b == 0xF7) {
+    if (b == 0xF7 || (b & 0x80)) {
       inSysEx = false;
+      lastMidiEventTime = millis();
       if (sysexOverflow) {
         sysexLen = 0;
         sysexOverflow = false;
         return; // 버퍼 초과로 잘린 손상 데이터는 파싱 건너뜀
       }
-      sysexBuf[sysexLen++] = b;
+      if (b == 0xF7) {
+        sysexBuf[sysexLen++] = b;
+      }
+
+      // [핵심] 시리얼로 실제 도착한 SysEx 바이트를 시리얼 모니터로 즉시 출력
+      Serial.printf("[RX SysEx %d B] ", sysexLen);
+      for (int i = 0; i < sysexLen && i < 12; i++) Serial.printf("%02X ", sysexBuf[i]);
+      Serial.println();
 
       // SysEx 분석
       if (sysexLen >= 20 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
           sysexBuf[4] == 0x12 && sysexBuf[5] == 0x20 && sysexBuf[6] == 0x00 &&
           sysexBuf[7] == 0x00) {
-        // Roland MT-32 LCD Text Display SysEx (F0 41 <dev> 16 12 20 00 00 <20
-        // ASCII chars> <chk> F7)
+        // Roland MT-32 LCD Text Display SysEx
         if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
           char lcdText[24] = {0};
           for (int i = 0; i < 20 && (8 + i) < sysexLen - 2; i++) {
@@ -629,75 +655,66 @@ void MIDIParser::parseSysExByte(uint8_t b) {
       } else if (sysexLen >= 11 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x10 &&
                  sysexBuf[6] == 0x00 && sysexBuf[7] == 0x01) {
-        // Roland MT-32 Reverb Parameter SysEx (F0 41 <dev> 16 12 10 00 01
-        // <mode> <time> <level> <chk> F7)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          g_synth_mode = SYNTH_MODE_MT32;
-          AudioEngine::setMT32ReverbDirect(
-              sysexBuf[8], sysexBuf[9], (sysexLen >= 13 ? sysexBuf[10] : 64));
-        }
-      } else if (sysexLen >= 16 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
+        // Roland MT-32 Reverb Parameter SysEx
+        MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+        AudioEngine::setMT32ReverbDirect(
+            sysexBuf[8], sysexBuf[9], (sysexLen >= 13 ? sysexBuf[10] : 64));
+      } else if (sysexLen >= 14 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
                  sysexBuf[4] == 0x12 &&
                  (sysexBuf[5] == 0x04 || sysexBuf[5] == 0x05 ||
                   sysexBuf[5] == 0x08)) {
-        // Roland MT-32 Timbre Temp / Patch Temp Memory Dump (커스텀 음색
-        // 파라미터 전송)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          g_synth_mode = SYNTH_MODE_MT32;
-          uint8_t targetPart = sysexBuf[6] & 0x07; // Part 1~8 -> Channel 1~8
-          uint8_t targetCh =
-              targetPart + 1; // MT-32 Part 1 = MIDI Ch 2(index 1)
-          SemaphoreHandle_t mutex = AudioEngine::getMutex();
-          if (mutex)
-            xSemaphoreTake(mutex, pdMS_TO_TICKS(50));
-          LA32SynthEngine::setCustomTimbre(targetCh, &sysexBuf[8],
-                                           sysexLen - 9);
-          if (mutex)
-            xSemaphoreGive(mutex);
-        }
+        // Roland MT-32 Timbre Temp / Patch Temp Memory Dump (체크섬 없이 즉시 모드 적용)
+        MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+        AudioEngine::applyMT32ModeDirect();
+
+        uint8_t targetPart = sysexBuf[6] & 0x07; // Part 1~8 -> Channel 1~8
+        uint8_t targetCh = targetPart + 1;       // MT-32 Part 1 = MIDI Ch 2(index 1)
+        SemaphoreHandle_t mutex = AudioEngine::getMutex();
+        if (mutex)
+          xSemaphoreTake(mutex, pdMS_TO_TICKS(50));
+        LA32SynthEngine::setCustomTimbre(targetCh, &sysexBuf[8],
+                                         sysexLen - 9);
+        if (mutex)
+          xSemaphoreGive(mutex);
       } else if (sysexLen >= 14 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x05 &&
                  (sysexBuf[7] == 0x00 || sysexBuf[7] == 0x02)) {
         // Roland MT-32 Patch Temp Memory (Key Shift, Fine Tune, Bender Range)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          g_synth_mode = SYNTH_MODE_MT32;
-          uint8_t targetPart = sysexBuf[6] & 0x07;
-          uint8_t targetCh = targetPart + 1;
-          if (sysexLen >= 16) {
-            int8_t keyShift = (int8_t)sysexBuf[10] - 24; // -24 ~ +24 semitones
-            float fineTune =
-                ((float)sysexBuf[11] - 50.0f) / 50.0f; // -50 ~ +50 cents
-            uint8_t bender = sysexBuf[12];             // 1 ~ 24 semitones
-            AudioEngine::setChannelKeyShift(targetCh, keyShift);
-            AudioEngine::setChannelTuningOffset(targetCh, fineTune);
-            if (bender > 0 && bender <= 24)
-              AudioEngine::setPitchRange(targetCh, (float)bender);
-          }
+        MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+        AudioEngine::applyMT32ModeDirect();
+
+        uint8_t targetPart = sysexBuf[6] & 0x07;
+        uint8_t targetCh = targetPart + 1;
+        if (sysexLen >= 16) {
+          int8_t keyShift = (int8_t)sysexBuf[10] - 24;
+          float fineTune =
+              ((float)sysexBuf[11] - 50.0f) / 50.0f;
+          uint8_t bender = sysexBuf[12];
+          AudioEngine::setChannelKeyShift(targetCh, keyShift);
+          AudioEngine::setChannelTuningOffset(targetCh, fineTune);
+          if (bender > 0 && bender <= 24)
+            AudioEngine::setPitchRange(targetCh, (float)bender);
         }
       } else if (sysexLen >= 11 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x03 &&
                  sysexBuf[6] == 0x01 && sysexBuf[7] == 0x10) {
-        // Roland MT-32 Rhythm Temp (F0 41 <dev> 16 12 03 01 10 <key> <timbre>
-        // <outLevel> <panpot> <reverb> <chk> F7)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          uint8_t key = sysexBuf[8];
-          uint8_t level = (sysexLen >= 13) ? sysexBuf[10] : 100;
-          uint8_t pan = (sysexLen >= 14) ? sysexBuf[11] : 7;
-          AudioEngine::setDrumKeyLevelDirect(key, level);
-          AudioEngine::setDrumKeyPanDirect(key, pan);
-        }
+        // Roland MT-32 Rhythm Temp
+        uint8_t key = sysexBuf[8];
+        uint8_t level = (sysexLen >= 13) ? sysexBuf[10] : 100;
+        uint8_t pan = (sysexLen >= 14) ? sysexBuf[11] : 7;
+        AudioEngine::setDrumKeyLevelDirect(key, level);
+        AudioEngine::setDrumKeyPanDirect(key, pan);
       } else if (sysexLen >= 6 && sysexBuf[1] == 0x7E && sysexBuf[3] == 0x09 &&
                  (sysexBuf[4] == 0x01 || sysexBuf[4] == 0x03)) {
-        // GM1 / GM2 System On (F0 7E 7F 09 01/03 F7)
-        g_synth_mode = (sysexBuf[4] == 0x03) ? SYNTH_MODE_GM2 : SYNTH_MODE_GM;
+        // GM1 / GM2 System On
+        MIDIParser::setSynthMode((sysexBuf[4] == 0x03) ? SYNTH_MODE_GM2 : SYNTH_MODE_GM);
         AudioEngine::applyGMModeDirect();
         AudioEngine::systemReset();
         clearAllVU();
       } else if (sysexLen >= 5 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16) {
-        // Roland MT-32 SysEx (F0 41 <dev> 16 ...) - 이미 MT-32 모드면 중복 리셋
-        // 방지
+        // Roland MT-32 SysEx (F0 41 <dev> 16 ...)
         if (g_synth_mode != SYNTH_MODE_MT32) {
-          g_synth_mode = SYNTH_MODE_MT32;
+          MIDIParser::setSynthMode(SYNTH_MODE_MT32);
           AudioEngine::applyMT32ModeDirect();
           clearAllVU();
         }
@@ -705,119 +722,103 @@ void MIDIParser::parseSysExByte(uint8_t b) {
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x00 && sysexBuf[7] == 0x7F) {
         // Roland GS Reset
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          g_synth_mode = SYNTH_MODE_GS;
-          AudioEngine::applyGSModeDirect();
-          AudioEngine::systemReset();
-          clearAllVU();
-        }
+        MIDIParser::setSynthMode(SYNTH_MODE_GS);
+        AudioEngine::applyGSModeDirect();
+        AudioEngine::systemReset();
+        clearAllVU();
       } else if (sysexLen >= 12 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x02 && sysexBuf[7] == 0x00) {
-        // Roland GS Master EQ (F0 41 <dev> 42 12 40 02 00 <LFreq> <LGain>
-        // <HFreq> <HGain> <chk> F7)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          int8_t lowGain = (int8_t)sysexBuf[9] - 64;
-          int8_t highGain = (int8_t)sysexBuf[11] - 64;
-          AudioEngine::setGSMasterEQ(sysexBuf[8], lowGain, sysexBuf[10],
-                                     highGain);
-        }
+        // Roland GS Master EQ
+        int8_t lowGain = (int8_t)sysexBuf[9] - 64;
+        int8_t highGain = (int8_t)sysexBuf[11] - 64;
+        AudioEngine::setGSMasterEQ(sysexBuf[8], lowGain, sysexBuf[10],
+                                   highGain);
       } else if (sysexLen >= 11 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x01 && sysexBuf[7] == 0x00) {
-        // Roland GS SC-55 LCD Text Display SysEx (F0 41 <dev> 42 12 40 01 00
-        // <text...> <chk> F7)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          char lcdText[36] = {0};
-          int maxChars = sysexLen - 10;
-          if (maxChars > 32)
-            maxChars = 32;
-          for (int i = 0; i < maxChars; i++) {
-            char c = (char)sysexBuf[8 + i];
-            lcdText[i] = (c >= 32 && c <= 126) ? c : ' ';
-          }
-          DisplayUI::showToast(lcdText, 3500);
+        // Roland GS SC-55 LCD Text Display SysEx
+        char lcdText[36] = {0};
+        int maxChars = sysexLen - 10;
+        if (maxChars > 32)
+          maxChars = 32;
+        for (int i = 0; i < maxChars; i++) {
+          char c = (char)sysexBuf[8 + i];
+          lcdText[i] = (c >= 32 && c <= 126) ? c : ' ';
         }
+        DisplayUI::showToast(lcdText, 3500);
       } else if (sysexLen >= 9 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x01 && sysexBuf[7] == 0x30) {
-        // Roland GS Reverb Parameters (Macro & Detailed)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          AudioEngine::setReverbMacroDirect(sysexBuf[8]);
-          if (sysexLen >= 14) {
-            AudioEngine::setGSReverbParamsDirect(sysexBuf[8], sysexBuf[10],
-                                                 sysexBuf[11], sysexBuf[12]);
-          }
+        // Roland GS Reverb Parameters
+        AudioEngine::setReverbMacroDirect(sysexBuf[8]);
+        if (sysexLen >= 14) {
+          AudioEngine::setGSReverbParamsDirect(sysexBuf[8], sysexBuf[10],
+                                               sysexBuf[11], sysexBuf[12]);
         }
       } else if (sysexLen >= 9 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x01 && sysexBuf[7] == 0x38) {
-        // Roland GS Chorus Parameters (Macro & Detailed)
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          AudioEngine::setChorusMacroDirect(sysexBuf[8]);
-          if (sysexLen >= 15) {
-            AudioEngine::setGSChorusParamsDirect(sysexBuf[10], sysexBuf[11],
-                                                 sysexBuf[12], sysexBuf[13],
-                                                 sysexBuf[14]);
-          }
+        // Roland GS Chorus Parameters
+        AudioEngine::setChorusMacroDirect(sysexBuf[8]);
+        if (sysexLen >= 15) {
+          AudioEngine::setGSChorusParamsDirect(sysexBuf[10], sysexBuf[11],
+                                               sysexBuf[12], sysexBuf[13],
+                                               sysexBuf[14]);
         }
       } else if (sysexLen >= 9 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  (sysexBuf[6] & 0xF0) == 0x10) {
         // Roland GS Part Parameters
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          g_synth_mode = SYNTH_MODE_GS;
-          uint8_t part = sysexBuf[6] & 0x0F;
-          uint8_t targetCh =
-              (part == 0) ? 9 : ((part <= 9) ? (part - 1) : part);
-          if (sysexBuf[7] == 0x08) { // Roland GS Part Vibrato Rate
-            AudioEngine::controlChange(targetCh, 76, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x09) { // Roland GS Part Vibrato Depth
-            AudioEngine::controlChange(targetCh, 77, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x0A) { // Roland GS Part Vibrato Delay
-            AudioEngine::controlChange(targetCh, 78, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x15) { // Roland GS Part Mode (Drum Map)
-            bool isDrum = (sysexBuf[8] != 0);
-            AudioEngine::setChannelDrumMode(targetCh, isDrum);
-            if (isDrum) {
-              AudioEngine::setBank(targetCh, 128);
-              AudioEngine::programChange(targetCh, 0);
-            }
-          } else if (sysexBuf[7] == 0x16) { // Roland GS Part Key Shift
-            AudioEngine::setChannelKeyShift(targetCh, (int8_t)sysexBuf[8] - 64);
-          } else if (sysexBuf[7] == 0x18) { // Roland GS Part Fine Tuning
-            AudioEngine::setChannelTuningOffset(
-                targetCh, ((float)sysexBuf[8] - 64.0f) / 64.0f);
-          } else if (sysexBuf[7] == 0x20) { // Roland GS Part TVF Cutoff
-            AudioEngine::controlChange(targetCh, 74, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x21) { // Roland GS Part TVF Resonance
-            AudioEngine::controlChange(targetCh, 71, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x22) { // Roland GS Part Attack Time
-            AudioEngine::controlChange(targetCh, 73, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x23) { // Roland GS Part Decay Time
-            AudioEngine::controlChange(targetCh, 75, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x24) { // Roland GS Part Release Time
-            AudioEngine::controlChange(targetCh, 72, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x33) { // Roland GS Part Reverb Send Level
-            AudioEngine::controlChange(targetCh, 91, sysexBuf[8]);
-          } else if (sysexBuf[7] == 0x34) { // Roland GS Part Chorus Send Level
-            AudioEngine::controlChange(targetCh, 93, sysexBuf[8]);
+        MIDIParser::setSynthMode(SYNTH_MODE_GS);
+        uint8_t part = sysexBuf[6] & 0x0F;
+        uint8_t targetCh =
+            (part == 0) ? 9 : ((part <= 9) ? (part - 1) : part);
+        if (sysexBuf[7] == 0x08) {
+          AudioEngine::controlChange(targetCh, 76, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x09) {
+          AudioEngine::controlChange(targetCh, 77, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x0A) {
+          AudioEngine::controlChange(targetCh, 78, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x15) {
+          bool isDrum = (sysexBuf[8] != 0);
+          AudioEngine::setChannelDrumMode(targetCh, isDrum);
+          if (isDrum) {
+            AudioEngine::setBank(targetCh, 128);
+            AudioEngine::programChange(targetCh, 0);
           }
+        } else if (sysexBuf[7] == 0x16) {
+          AudioEngine::setChannelKeyShift(targetCh, (int8_t)sysexBuf[8] - 64);
+        } else if (sysexBuf[7] == 0x18) {
+          AudioEngine::setChannelTuningOffset(
+              targetCh, ((float)sysexBuf[8] - 64.0f) / 64.0f);
+        } else if (sysexBuf[7] == 0x20) {
+          AudioEngine::controlChange(targetCh, 74, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x21) {
+          AudioEngine::controlChange(targetCh, 71, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x22) {
+          AudioEngine::controlChange(targetCh, 73, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x23) {
+          AudioEngine::controlChange(targetCh, 75, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x24) {
+          AudioEngine::controlChange(targetCh, 72, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x33) {
+          AudioEngine::controlChange(targetCh, 91, sysexBuf[8]);
+        } else if (sysexBuf[7] == 0x34) {
+          AudioEngine::controlChange(targetCh, 93, sysexBuf[8]);
         }
       } else if (sysexLen >= 10 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x41) {
         // Roland GS Drum Setup
-        if (isValidRolandChecksum(&sysexBuf[5], sysexLen - 6)) {
-          uint8_t param = sysexBuf[6] & 0x0F;
-          uint8_t key = sysexBuf[7];
-          uint8_t val = sysexBuf[8];
-          if (param == 0x01) { // Drum Key Pitch Coarse
-            AudioEngine::setDrumKeyPitchDirect(key, (int8_t)val - 64);
-          } else if (param == 0x04) { // Drum Key Level
-            AudioEngine::setDrumKeyLevelDirect(key, val);
-          } else if (param == 0x05) { // Drum Key Panpot
-            AudioEngine::setDrumKeyPanDirect(key, val);
-          }
+        uint8_t param = sysexBuf[6] & 0x0F;
+        uint8_t key = sysexBuf[7];
+        uint8_t val = sysexBuf[8];
+        if (param == 0x01) {
+          AudioEngine::setDrumKeyPitchDirect(key, (int8_t)val - 64);
+        } else if (param == 0x04) {
+          AudioEngine::setDrumKeyLevelDirect(key, val);
+        } else if (param == 0x05) {
+          AudioEngine::setDrumKeyPanDirect(key, val);
         }
       } else if (sysexLen >= 19 &&
                  (sysexBuf[1] == 0x7E || sysexBuf[1] == 0x7F) &&
@@ -841,10 +842,15 @@ void MIDIParser::parseSysExByte(uint8_t b) {
         uint8_t vol = (uint8_t)((rawVol * 100) / 16383);
         AudioEngine::setMasterVolume(vol);
       }
-      return;
-    } else if (b & 0x80) { // 비정상 종료
-      inSysEx = false;
+      sysexLen = 0;
       sysexOverflow = false;
+      if (b == 0xF0) {
+        inSysEx = true;
+        sysexBuf[sysexLen++] = b;
+      }
+      return;
+    } else if (b >= 0xF8) {
+      return;
     } else {
       if (sysexLen < sizeof(sysexBuf) - 1) {
         sysexBuf[sysexLen++] = b;
@@ -863,7 +869,7 @@ void MIDIParser::clearAllVU() {
 }
 
 void MIDIParser::update() {
-  // UART 수신 버퍼 처리 (블록 단위 고속 읽기로 함수 호출 오버헤드 축소)
+  // 1. UART 수신 버퍼 처리
   int avail = SerialMIDI.available();
   if (avail > 0) {
     if (avail > 256)
@@ -875,15 +881,22 @@ void MIDIParser::update() {
     }
   }
 
-  // 소리가 안 나거나(정지/일시정지/무음) 노트가 끝났을 때 스르륵 0으로 감쇠
-  // (Smooth decay)
+  // 시리얼 무신호 2초 감지 시 GM 모드로 자동 복구
+  if (lastMidiEventTime > 0 && (millis() - lastMidiEventTime >= 2000)) {
+    if (g_synth_mode != SYNTH_MODE_GM) {
+      MIDIParser::setSynthMode(SYNTH_MODE_GM);
+      AudioEngine::applyGMModeDirect();
+      clearAllVU();
+    }
+    lastMidiEventTime = 0;
+  }
+
+  // 3. VU 미터 부드러운 감쇠 루틴 (35ms 주기)
   static unsigned long lastDecayTime = 0;
-  if (millis() - lastDecayTime >= 35) { // 35ms 주기 부드러운 감쇠
+  if (millis() - lastDecayTime >= 35) {
     lastDecayTime = millis();
     for (int i = 0; i < 16; i++) {
       if (channels[i].vuLevel > 0) {
-        // 시퀀서가 재생 중이지 않거나, 마지막 노트 발생 후 120ms 경과 시 스르륵
-        // 감소
         if (millis() - channels[i].lastNoteTime > 120) {
           if (channels[i].vuLevel > 2)
             channels[i].vuLevel -= 2;

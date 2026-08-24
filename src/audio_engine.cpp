@@ -443,7 +443,7 @@ bool AudioEngine::begin() {
 // MIDI 메시지 처리
 void AudioEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
         noteOnDirect(channel, key, velocity);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -451,7 +451,7 @@ void AudioEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity) {
 
 void AudioEngine::noteOff(uint8_t channel, uint8_t key) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
         noteOffDirect(channel, key);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -459,7 +459,7 @@ void AudioEngine::noteOff(uint8_t channel, uint8_t key) {
 
 void AudioEngine::programChange(uint8_t channel, uint8_t program) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
         programChangeDirect(channel, program);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -467,7 +467,7 @@ void AudioEngine::programChange(uint8_t channel, uint8_t program) {
 
 void AudioEngine::controlChange(uint8_t channel, uint8_t controller, uint8_t value) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
         tsf_channel_midi_control(g_tsf, channel, controller, value);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -475,7 +475,7 @@ void AudioEngine::controlChange(uint8_t channel, uint8_t controller, uint8_t val
 
 void AudioEngine::pitchBend(uint8_t channel, uint16_t value) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
         tsf_channel_set_pitchwheel(g_tsf, channel, (int)value);
         xSemaphoreGive(g_tsf_mutex);
     }

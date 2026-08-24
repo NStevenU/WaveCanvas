@@ -72,7 +72,7 @@ void loop() {
         DisplayUI::handleEncoderEvent(ev);
     }
 
-    MIDIParser::update();
+    //MIDIParser::update();
     TimeManager::update();
     LEDIndicator::update();
     AudioEngine::flushVolumeNVS();
