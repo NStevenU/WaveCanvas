@@ -117,21 +117,21 @@ static String generateHTML(const String& tab, const String& lang, const String& 
     html += "body { background-color: #ffffff; color: #000000; font-family: Tahoma, 'MS Sans Serif', Dotum, Gulim, sans-serif; font-size: 12px; margin: 10px; min-width: 740px; }\n";
     html += "table { font-size: 12px; }\n";
     html += ".header-table { background-color: #f0f0f0; border-bottom: 2px solid #000080; padding: 4px; }\n";
-    html += ".tab-active { background-color: #000080; color: #ffffff !important; font-weight: bold; padding: 5px 10px; text-decoration: none; border: 1px solid #000080; display: inline-block; }\n";
-    html += ".tab-inactive { background-color: #e0e0e0; color: #000000 !important; padding: 5px 10px; text-decoration: none; border: 1px solid #999999; display: inline-block; }\n";
+    html += "a.tab-active, .tab-active { background-color: #000080; color: #ffffff; font-weight: bold; padding: 5px 10px; text-decoration: none; border: 1px solid #000080; display: inline-block; }\n";
+    html += "a.tab-inactive, .tab-inactive { background-color: #e0e0e0; color: #000000; padding: 5px 10px; text-decoration: none; border: 1px solid #999999; display: inline-block; }\n";
     html += ".tab-inactive:hover { background-color: #d0d0d0; }\n";
-    html += ".btn98 { background-color: #d4d0c8; border-top: 2px solid #ffffff; border-left: 2px solid #ffffff; border-right: 2px solid #808080; border-bottom: 2px solid #808080; padding: 2px 6px; font-family: Tahoma, 'MS Sans Serif', Dotum, Gulim, sans-serif; font-size: 12px; color: #000000; cursor: pointer; vertical-align: middle; overflow: visible; }\n";
-    html += ".btn98:active { border-color: #808080 #ffffff #ffffff #808080; }\n";
+    html += ".btn98 { background-color: #c0c0c0; border-top: 2px solid #ffffff; border-left: 2px solid #ffffff; border-right: 2px solid #808080; border-bottom: 2px solid #808080; padding: 2px 6px; font-family: Tahoma, 'MS Sans Serif', Dotum, Gulim, sans-serif; font-size: 12px; color: #000000; cursor: pointer; vertical-align: middle; overflow: visible; }\n";
+    html += ".btn98:active { border-color: #808080 #ffffff #ffffff #808080; padding: 3px 5px 1px 7px; }\n";
     html += ".inset-box { background-color: #ffffff; border: 2px solid; border-color: #808080 #ffffff #ffffff #808080; padding: 4px; }\n";
     html += ".section-table { border: 1px solid #999999; background-color: #fafafa; margin-bottom: 12px; }\n";
     html += ".section-hdr { background-color: #000080; color: #ffffff; font-weight: bold; padding: 4px 8px; }\n";
-    html += ".status-bar { background-color: #d4d0c8; border-top: 1px solid #808080; padding: 4px 8px; font-size: 11px; margin-top: 15px; }\n";
+    html += ".status-bar { background-color: #c0c0c0; border-top: 1px solid #808080; padding: 4px 8px; font-size: 11px; margin-top: 15px; }\n";
     html += "img.ic { vertical-align: middle; margin-right: 4px; }\n";
 
     // 90년대 클래식 DHTML 3D 슬라이더 스타일 (IE 4~9 레거시용)
     html += ".sl-track { position: relative; width: 140px; height: 16px; display: inline; vertical-align: middle; cursor: pointer; }\n";
     html += ".sl-groove { position: absolute; top: 7px; left: 0px; width: 130px; height: 2px; background-color: #808080; border-bottom: 1px solid #ffffff; font-size: 1px; line-height: 1px; overflow: hidden; }\n";
-    html += ".sl-thumb { position: absolute; top: 0px; width: 10px; height: 16px; background-color: #d4d0c8; border-top: 1px solid #ffffff; border-left: 1px solid #ffffff; border-right: 1px solid #404040; border-bottom: 1px solid #404040; font-size: 1px; line-height: 1px; overflow: hidden; cursor: pointer; }\n";
+    html += ".sl-thumb { position: absolute; top: 0px; width: 10px; height: 16px; background-color: #c0c0c0; border-top: 1px solid #ffffff; border-left: 1px solid #ffffff; border-right: 1px solid #404040; border-bottom: 1px solid #404040; font-size: 1px; line-height: 1px; overflow: hidden; cursor: pointer; }\n";
 
     // 가상 피아노 건반 스타일 (IE 4.0 ~ 모던 브라우저 100% 호환)
     html += ".piano-box { background: #222222; padding: 12px; border: 2px solid; border-color: #808080 #dfdfdf #dfdfdf #808080; display: block; width: 480px; user-select: none; -webkit-user-select: none; }\n";
