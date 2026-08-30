@@ -13,7 +13,7 @@
 **WaveCanvas**는 ESP32-S3(N16R8)의 240MHz 듀얼 코어와 8MB Octal SPI PSRAM을 기반으로 구축된 **독립형 임베디드 MIDI 신디사이저 및 사운드 모듈**입니다.  
 구형 DOS 노트북 및 레트로 PC의 **SoftMPU / RS-232 시리얼 직결**을 지원하며, **32 동시 발음수(32-Voice Polyphony)**, **SoundFont2 뱅크 라우팅**, **Roland LA-32 커스텀 음색 소프트웨어 합성 엔진**, **32-bit Float DSP 파이프라인**, **1990년대 후반 레트로 웹 GUI(Nexisson Tech 1998 컨셉)** 를 탑재하고 있습니다.
 
-[면책 안내](#-프로젝트-성격-및-면책-안내-project-disclaimer) • [주요 특징](#-주요-특징-key-features) • [하드웨어 갤러리](#-3d-프린팅-케이스--하드웨어-갤러리) • [제작 & 조립 가이드](#-만능기판-회로-설계--본체-조립-가이드) • [스피커 제작 가이드](#-외장-스피커-모듈-제작--음향-밀폐-노하우) • [핀맵](#-하드웨어-핀맵-hardware-pinout) • [조작 가이드](#-oled-ui-및-로터리-엔코더-조작법) • [웹 관리자](#-1990년대-후반-클래식-웹-관리자-web-gui) • [빌드 가이드](#-빌드-및-업로드-방법-build--flashing)
+[면책 안내](#-프로젝트-성격-및-면책-안내-project-disclaimer) • [주요 특징](#-주요-특징-key-features) • [하드웨어 갤러리](#-3d-프린팅-케이스--하드웨어-갤러리) • [제작 & 조립 가이드](#-만능기판-회로-설계--본체-조립-가이드) • [스피커 제작 가이드](#-외장-스피커-모듈-제작--음향-밀폐-노하우) • [핀맵](#-하드웨어-핀맵-hardware-pinout) • [조작 가이드](#-oled-ui-및-로터리-엔코더-조작법) • [드라이버 설정](#-레트로-pc-연결-및-필수-드라이버-설정-가이드) • [웹 관리자](#-1990년대-후반-클래식-웹-관리자-web-gui) • [빌드 가이드](#-빌드-및-업로드-방법-build--flashing)
 
 ---
 
@@ -278,6 +278,41 @@
 4. **`4. 벽돌깨기 (Brick Breaker)`**: 높이별 주파수 파괴음 및 승리 팡파레
 5. **`5. 스네이크 (Snake)`**: 방향 조작 및 먹이 섭취 사운드  
 *(※ 플레이 중 **엔코더 버튼을 5초간 길게 누르면 게임을 종료**하고 메뉴로 복귀합니다.)*
+
+---
+
+<br>
+
+## 🔌 레트로 PC 연결 및 필수 드라이버 설정 가이드
+
+WaveCanvas는 구형 노트북 및 레트로 PC의 9핀 RS-232 COM 포트 직결을 완벽하게 지원합니다. 연결하는 운영체제(OS) 환경에 맞추어 아래의 드라이버 및 유틸리티를 설정해 주세요.
+
+### 1. 🕹️ MS-DOS 게임 환경 (SoftMPU)
+DOS 게임에서 Roland MT-32 또는 General MIDI / Sound Canvas BGM을 출력할 때 **SoftMPU** 유틸리티를 사용합니다.
+
+* **권장 통신 속도 (Baud Rate)**: `38,400 bps` (WaveCanvas OLED 메뉴 `7. 통신 속도` $\to$ `38400` 설정)
+* **SoftMPU 구동 명령어 예시**:
+  ```bat
+  REM COM1 포트로 MPU-401 MIDI 신호를 38,400bps로 전송
+  SOFTMPU.EXE /MPU:330 /OUTPUT:COM1
+
+  REM 사운드 블래스터 호환 인터럽트 연동 (MT-32 지능형 모드 지원 게임용)
+  SOFTMPU.EXE /SB:220 /IRQ:5 /MPU:330 /OUTPUT:COM1
+  ```
+* **게임 내 사운드 설정**: 사운드 설정 메뉴(Setup/Install)에서 `Roland Sound Canvas (SC-55/SCC-1)`, `General MIDI`, 또는 `Roland MT-32 (Port 330h)`를 선택합니다.
+
+---
+
+### 2. 🪟 Windows 95 / 98 / ME / 2000 / XP 레트로 환경 (Roland Serial MIDI Driver)
+Windows 레트로 PC의 시리얼(COM) 포트를 표준 MIDI 출력 장치로 사용하려면 **Roland 공식 시리얼 MIDI 드라이버**가 필요합니다.
+
+* **필수 드라이버**: **Roland Serial MIDI Driver v3.2**
+* **드라이버 설정 방법**:
+  1. `Roland Serial MIDI Driver v3.2`를 설치합니다.
+  2. 제어판의 드라이버 설정에서 연결된 **COM 포트 (예: `COM1`)**를 지정합니다.
+  3. 통신 속도(Baud Rate)를 **`38,400 bps`**로 맞춥니다.
+  4. 제어판 `멀티미디어(사운드)` $\to$ `MIDI 출력 장치`를 **`Roland Serial MIDI Out`**으로 지정합니다.
+  5. WaveCanvas 본체의 통신 속도도 **`38400 bps`**로 일치시킵니다.
 
 ---
 

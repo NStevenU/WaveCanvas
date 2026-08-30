@@ -10,7 +10,7 @@
 // 아래 정의를 주석 해제하면 실시간 오디오 지연시간, PSRAM 워터마크, 32보이스 부하,
 // 대량 SysEx 카운터 및 웹 진단 대시보드(/?tab=debug)가 활성화됩니다.
 // 주석 처리(//)하면 모든 계측 코드가 컴파일 타임에 100% 제거되어 제로 오버헤드가 됩니다.
-#define ENABLE_DEBUG_METRICS
+//#define ENABLE_DEBUG_METRICS
 
 #if defined(ENABLE_DEBUG_METRICS)
 
