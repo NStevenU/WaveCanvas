@@ -7,6 +7,8 @@ enum ScreenMode {
     SCREEN_MAIN_MIDI,
     SCREEN_MENU_MAIN,
     SCREEN_MENU_MIDI_LIBRARY,
+    SCREEN_MENU_SYNTH_MODE,
+    SCREEN_MENU_MANUAL_MODE,
     SCREEN_MENU_SOUNDFONT,
     SCREEN_MENU_WIFI_INFO,
     SCREEN_MENU_BAUDRATE,
@@ -40,6 +42,8 @@ private:
     static bool fontManagementEnabled;
     static int menuIndex;
     static int midiMenuIndex;
+    static int synthModeMenuIndex;
+    static int manualModeMenuIndex;
     static int sfMenuIndex;
     static int baudMenuIndex;
     static int audioTestMenuIndex;
@@ -58,6 +62,8 @@ private:
     static void drawMainMIDIScreen();
     static void drawMainMenu();
     static void drawMIDILibraryMenu();
+    static void drawSynthModeMenu();
+    static void drawManualModeMenu();
     static void drawSoundFontMenu();
     static void drawWiFiInfoMenu();
     static void drawBaudRateMenu();

@@ -103,8 +103,10 @@ GameEngine::SFXSlot GameEngine::sfxSlots[4] = {
 
 // --- 8비트 사운드 발음 헬퍼 (논블로킹 타이머 슬롯 기반 - FreeRTOS 태스크 오버헤드 0) ---
 void GameEngine::play8BitSound(uint8_t note, uint16_t durationMs, uint8_t program, uint8_t ch, uint8_t vel) {
+    // 🌟 효과음 채널(Ch 15)을 확실하게 8비트 아케이드 사운드(Square Lead, Program 80) 및 Bank 0으로 고정
+    AudioEngine::setBank(ch, 0);
     AudioEngine::programChange(ch, program);
-    AudioEngine::controlChange(ch, 10, 64); // Pan Center
+    AudioEngine::controlChange(ch, 7, 95); // 효과음 음량 확보
     AudioEngine::noteOn(ch, note, vel);
     
     unsigned long now = millis();
@@ -141,6 +143,11 @@ void GameEngine::init(GameType type) {
     MIDISequencer::stop();
     MIDISequencer::setLoop(false);
     AudioEngine::panic();
+
+    // Ch 15 (16번 채널) 8비트 아케이드 SFX 전용 악기(Square Lead) 사전 등록
+    AudioEngine::programChange(15, 80);
+    AudioEngine::controlChange(15, 7, 95);
+    AudioEngine::controlChange(15, 10, 64);
 
     switch (type) {
         case GAME_PIANO:       initPiano(); break;
@@ -472,10 +479,14 @@ void GameEngine::initBlockStack() {
     MIDISequencer::setLoop(true);
     MIDISequencer::play();
 
-    uint8_t tetrisChannels[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    for (uint8_t ch : tetrisChannels) {
-        AudioEngine::controlChange(ch, 7, 90);
-        AudioEngine::controlChange(ch, 11, 127);
+    SemaphoreHandle_t mutex = AudioEngine::getMutex();
+    if (mutex && xSemaphoreTake(mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        uint8_t tetrisChannels[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        for (uint8_t ch : tetrisChannels) {
+            AudioEngine::controlChangeDirect(ch, 7, 90);
+            AudioEngine::controlChangeDirect(ch, 11, 127);
+        }
+        xSemaphoreGive(mutex);
     }
 
     spawnPiece();
@@ -486,7 +497,7 @@ void GameEngine::spawnPiece() {
     nextPiece = rand() % 7;
     pieceRotation = 0;
     pieceX = 3;
-    pieceY = 0;
+    pieceY = 8; // 가시 영역(9~19행) 상단 바로 안쪽에 즉시 스폰!
 
     if (checkCollision(pieceX, pieceY, currentPiece, pieceRotation)) {
         stackGameOver = true;
@@ -585,8 +596,8 @@ void GameEngine::updateBlockStack(U8G2& u8g2) {
     }
 
     // 상단 헤더 (Yellow 영역 Y: 0 ~ 14)
-    u8g2.setFont(u8g2_font_galmuri9);
-    u8g2.drawUTF8(2, 9, "[BLOCK STACK]");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(2, 9, "[BLOCK STACK]");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(82, 8, "[5s Exit]");
     u8g2.drawHLine(0, 14, 128);

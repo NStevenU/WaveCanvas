@@ -79,6 +79,7 @@ struct LA32Voice {
     uint8_t structure34;
     float pitchSlide;
     float pitchSlideStep;
+    float pitchBendSemitones;
 };
 
 class LA32SynthEngine {
@@ -89,6 +90,7 @@ public:
     static void noteOn(uint8_t channel, uint8_t key, uint8_t velocity, float panNorm = 0.5f);
     static void noteOff(uint8_t channel, uint8_t key);
     static void allNotesOff(uint8_t channel);
+    static void pitchBend(uint8_t channel, float semitones);
 
     static void setCustomTimbre(uint8_t channel, const uint8_t* timbreData, size_t length);
     static bool isChannelCustom(uint8_t channel);

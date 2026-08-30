@@ -5,6 +5,7 @@
 #include "la32_synth.h"
 #include "led_indicator.h"
 #include "midi_sequencer.h"
+#include <Preferences.h>
 
 // 128종 표준 General MIDI 악기명 테이블
 static const char *const GM_INSTRUMENTS[128] = {"Acoustic Piano",
@@ -276,24 +277,89 @@ uint8_t MIDIParser::expectedLength = 0;
 uint16_t MIDIParser::channelRPN[16] = {
     0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F,
     0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F};
+uint16_t MIDIParser::channelNRPN[16] = {
+    0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F,
+    0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F};
 static unsigned long lastMidiEventTime = 0;
 static SynthMode g_synth_mode = SYNTH_MODE_GM;
+static SynthPolicy g_synth_policy = SYNTH_POLICY_AUTO;
+static ManualSubMode g_manual_sub_mode = MANUAL_MODE_GM;
+static uint16_t s_activeChannelMask = 0;
 
 static HardwareSerial SerialMIDI(2);
 
 SynthMode MIDIParser::getSynthMode() { return g_synth_mode; }
 
 void MIDIParser::setSynthMode(SynthMode mode) {
+  if (g_synth_policy == SYNTH_POLICY_MANUAL) {
+    mode = (g_manual_sub_mode == MANUAL_MODE_GS) ? SYNTH_MODE_GS :
+           (g_manual_sub_mode == MANUAL_MODE_MT32) ? SYNTH_MODE_MT32 : SYNTH_MODE_GM;
+  }
   if (g_synth_mode != mode) {
     g_synth_mode = mode;
     AudioEngine::setMasterVolumeDirect(AudioEngine::getMasterVolume());
   }
 }
 
+SynthPolicy MIDIParser::getSynthPolicy() { return g_synth_policy; }
+
+void MIDIParser::setSynthPolicy(SynthPolicy policy, bool save) {
+  g_synth_policy = policy;
+  if (g_synth_policy == SYNTH_POLICY_MANUAL) {
+    setManualSubMode(g_manual_sub_mode, false);
+  }
+  if (save) {
+    Preferences prefs;
+    if (prefs.begin("synth_cfg", false)) {
+      prefs.putUChar("policy", (uint8_t)g_synth_policy);
+      prefs.end();
+    }
+  }
+}
+
+ManualSubMode MIDIParser::getManualSubMode() { return g_manual_sub_mode; }
+
+void MIDIParser::setManualSubMode(ManualSubMode mode, bool save) {
+  g_manual_sub_mode = mode;
+  if (g_synth_policy == SYNTH_POLICY_MANUAL) {
+    switch (g_manual_sub_mode) {
+    case MANUAL_MODE_GS:
+      setSynthMode(SYNTH_MODE_GS);
+      AudioEngine::applyGSModeDirect();
+      break;
+    case MANUAL_MODE_MT32:
+      setSynthMode(SYNTH_MODE_MT32);
+      AudioEngine::applyMT32ModeDirect();
+      break;
+    case MANUAL_MODE_GM:
+    default:
+      setSynthMode(SYNTH_MODE_GM);
+      LA32SynthEngine::reset();
+      AudioEngine::applyGMModeDirect();
+      break;
+    }
+    AudioEngine::panicDirect();
+  }
+  if (save) {
+    Preferences prefs;
+    if (prefs.begin("synth_cfg", false)) {
+      prefs.putUChar("manual_sub", (uint8_t)g_manual_sub_mode);
+      prefs.end();
+    }
+  }
+}
+
+void MIDIParser::cycleManualSubMode() {
+  if (g_synth_policy != SYNTH_POLICY_MANUAL) {
+    setSynthPolicy(SYNTH_POLICY_MANUAL, true);
+    return;
+  }
+  uint8_t next = ((uint8_t)g_manual_sub_mode + 1) % 3;
+  setManualSubMode((ManualSubMode)next, true);
+}
+
 const char *MIDIParser::getSynthModeString() {
   switch (g_synth_mode) {
-  case SYNTH_MODE_GM2:
-    return "[GM2]";
   case SYNTH_MODE_GS:
     return "[GS]";
   case SYNTH_MODE_MT32:
@@ -304,15 +370,32 @@ const char *MIDIParser::getSynthModeString() {
   }
 }
 
+const char *MIDIParser::getIndicatorString() {
+  bool isManual = (g_synth_policy == SYNTH_POLICY_MANUAL);
+  switch (g_synth_mode) {
+  case SYNTH_MODE_GS:
+    return isManual ? "[M: GS]" : "[A: GS]";
+  case SYNTH_MODE_MT32:
+    return isManual ? "[M: MT-32]" : "[A: MT-32]";
+  case SYNTH_MODE_GM:
+  default:
+    return isManual ? "[M: GM]" : "[A: GM]";
+  }
+}
+
 static void serialMidiTask(void* pv) {
+    uint8_t rxBuf[128];
     while (true) {
-        // 하드웨어 FIFO에 데이터가 있으면 쉬지 않고 즉시 전량 처리
-        while (SerialMIDI.available() > 0) {
-          uint8_t b = SerialMIDI.read();
-          MIDIParser::parseByte(b);
+        int avail = SerialMIDI.available();
+        if (avail > 0) {
+            int toRead = (avail > (int)sizeof(rxBuf)) ? (int)sizeof(rxBuf) : avail;
+            int count = SerialMIDI.readBytes(rxBuf, toRead);
+            for (int i = 0; i < count; i++) {
+                MIDIParser::parseByte(rxBuf[i]);
+            }
         }
         MIDIParser::update(); // 무신호 감지 및 VU 미터 처리
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(1)); // Core 0 Watchdog 및 DisplayTask에 확실한 CPU 양보 (재부팅 원천 차단)
     }
 }
 
@@ -329,12 +412,26 @@ void MIDIParser::begin(uint32_t baudRate) {
     channels[i].vuLevel = 0;
     channels[i].lastNoteTime = 0;
     channelRPN[i] = 0x7F7F; // RPN Null
+    channelNRPN[i] = 0x7F7F; // NRPN Null
   }
   channels[9].program = 0; // Drum Kit
   lastMidiEventTime = 0;
 
+  // NVS 설정 복원
+  Preferences prefs;
+  if (prefs.begin("synth_cfg", true)) {
+    g_synth_policy = (SynthPolicy)prefs.getUChar("policy", (uint8_t)SYNTH_POLICY_AUTO);
+    g_manual_sub_mode = (ManualSubMode)prefs.getUChar("manual_sub", (uint8_t)MANUAL_MODE_GM);
+    prefs.end();
+  }
+  if (g_synth_policy == SYNTH_POLICY_MANUAL) {
+    setManualSubMode(g_manual_sub_mode, false);
+  }
+
   // Core 0에서 화면/네트워크(1~2)보다 높은 우선순위 4로 생성
-  xTaskCreatePinnedToCore(serialMidiTask, "SerialMIDI", 4096, NULL, 4, NULL, 0);
+  TaskHandle_t hMidi = NULL;
+  xTaskCreatePinnedToCore(serialMidiTask, "SerialMIDI", 4096, NULL, 4, &hMidi, 0);
+  DEBUG_REG_MIDI_TASK(hMidi);
 }
 
 bool MIDIParser::isMIDIActive() {
@@ -385,6 +482,7 @@ void MIDIParser::resetChannelStatus(uint8_t ch) {
     channels[ch].vuLevel = 0;
     channels[ch].lastNoteTime = 0;
     channelRPN[ch] = 0x7F7F;
+    channelNRPN[ch] = 0x7F7F;
   }
 }
 
@@ -432,17 +530,166 @@ void MIDIParser::setLastActiveChannel(uint8_t ch) {
   }
 }
 
+static uint32_t s_lastGSResetTime = 0;
+static uint32_t s_lastGlobalNoteTime = 0;
+static bool s_sessionActive = false;   // 첫 Note On 발음 이후 true로 잠금(Lock)
+static bool s_hasPlayedNotes = false;  // 실제 음표(Note On)가 연주되었는지 여부
+static bool s_hasGSFingerprint = false; // 프리롤에서 GS 지문 감지 여부
+static bool s_hasMT32Fingerprint = false; // 프리롤에서 MT-32 지문 감지 여부
+
+// 채널별 설정 수신 추적 마스크 (16개 채널)
+static bool s_chExprSet[16] = {false};
+static bool s_chVolumeSet[16] = {false};
+static bool s_chBankSet[16] = {false};
+static bool s_chProgSet[16] = {false};
+static bool s_chPanSet[16] = {false};
+
 void MIDIParser::processCompleteMessage() {
-  lastMidiEventTime = millis();
-  DisplayUI::onExternalMIDIActivity();
+  DEBUG_RECORD_MIDI();
+  uint32_t now = millis();
+  uint32_t idleMs = (lastMidiEventTime > 0) ? (now - lastMidiEventTime) : 999999;
+
   uint8_t status = msgBuffer[0] & 0xF0;
   uint8_t channel = msgBuffer[0] & 0x0F;
+
+  // [새 곡 시작 감지: 이전 곡이 실제로 연주된 후 4.0초 이상 무음이 경과하고 새 이벤트가 들어올 때만 세션 윈도우 개방!]
+  // 🌟 아직 첫 음표가 나오지 않은 프리롤 구간(!s_hasPlayedNotes)에서는 인트로 무음이 6초 이상 발생하더라도 프리롤 설정을 절대 리셋하지 않음!
+  if (lastMidiEventTime == 0 || (s_hasPlayedNotes && idleMs >= 4000)) {
+    s_hasPlayedNotes = false;   // 아직 음표는 연주되지 않음!
+    s_sessionActive = false;    // 새 곡을 위한 프리롤 감지 윈도우 개방!
+    s_hasGSFingerprint = false;
+    s_hasMT32Fingerprint = false;
+    s_activeChannelMask = 0;
+
+    // 파라미터 수신 마스크 초기화
+    for (int c = 0; c < 16; c++) {
+      s_chExprSet[c] = false;
+      s_chVolumeSet[c] = false;
+      s_chBankSet[c] = false;
+      s_chProgSet[c] = false;
+      s_chPanSet[c] = false;
+      channelRPN[c] = 0x7F7F;
+      channelNRPN[c] = 0x7F7F;
+    }
+
+    // 이전 곡의 잔여 발음 음표만 안전하게 정지 (모드/파라미터는 프리롤 수집을 위해 보존!)
+    if (g_synth_mode == SYNTH_MODE_MT32) {
+      for (int ch = 0; ch < 16; ch++) {
+        LA32SynthEngine::allNotesOff(ch);
+      }
+    }
+  }
+
+  lastMidiEventTime = now;
+  DisplayUI::onExternalMIDIActivity();
 
   switch (status) {
   case 0x90: { // Note On
     uint8_t note = msgBuffer[1];
     uint8_t vel = msgBuffer[2];
     if (vel > 0) {
+      s_lastGlobalNoteTime = now;
+      // 실시간 UART는 프리롤의 CC/볼륨/팬 초기화로 채널이 오염되지 않도록,
+      // 실제 음표가 발생한 채널만 활성 마스크에 반영한다.
+      s_activeChannelMask |= (1 << channel);
+
+      // 🌟 [원자적 모드 확정 및 미설정 파라미터 선별 플러시 (Atomic Staging & Untouched Flush)]
+      // 첫 음표가 발음되기 직전 딱 1회 실행!
+      if (!s_sessionActive) {
+        if (g_synth_policy == SYNTH_POLICY_MANUAL) {
+          // 🔒 수동 모드 고정: 사용자가 지정한 서브 모드로 강제 확정 (자동 전환 원천 차단)
+          switch (g_manual_sub_mode) {
+          case MANUAL_MODE_GS:
+            MIDIParser::setSynthMode(SYNTH_MODE_GS);
+            break;
+          case MANUAL_MODE_MT32:
+            MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+            break;
+          case MANUAL_MODE_GM:
+          default:
+            MIDIParser::setSynthMode(SYNTH_MODE_GM);
+            break;
+          }
+        } else {
+          // 🌐 스마트 자동 모드:
+          // 1. MT-32 모드: 이번 곡에서 MT-32 SysEx가 감지되었거나,
+          //    직전이 MT-32 모드이면서 이번 곡에 Ch 0 및 Ch 10~15가 전혀 없고 오직 MT-32 채널(1~9)만 사용될 때!
+          bool isPureMT32 = (s_hasMT32Fingerprint) ||
+                            (g_synth_mode == SYNTH_MODE_MT32 && (s_activeChannelMask & 0xFC01) == 0 && channel != 0 && channel < 10);
+          if (isPureMT32) {
+            MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+          }
+          // 2. GS 모드 확정 시 (이번 곡에서 실제 GS 지문이 감지된 경우)
+          else if (s_hasGSFingerprint) {
+            MIDIParser::setSynthMode(SYNTH_MODE_GS);
+            for (int ch = 0; ch < 16; ch++) {
+              if (!s_chExprSet[ch]) {
+                channels[ch].expression = 127;
+                AudioEngine::controlChange(ch, 11, 127);
+              }
+              if (!s_chVolumeSet[ch]) {
+                channels[ch].volume = 100;
+                AudioEngine::controlChange(ch, 7, 100);
+              }
+              if (!s_chBankSet[ch]) {
+                if (ch != 9) AudioEngine::setBank(ch, 0);
+              }
+            }
+          }
+          // 3. 순수 GM 모드 확정 시 (PM2 GM, All For You, 동방 등: MT-32 -> GM 및 GS -> GM 완벽 전환!)
+          else {
+            MIDIParser::setSynthMode(SYNTH_MODE_GM);
+            LA32SynthEngine::reset();
+            AudioEngine::resetMT32FilterDirect();
+            AudioEngine::resetDrumKeyParamsDirect();       // 🌟 드럼 키 피치/팬/볼륨/컷오프 100% 클린 리셋!
+            AudioEngine::setGSMasterEQDirect(0, 0, 0, 0); // 🌟 마스터 EQ 0dB 플랫 복구!
+            AudioEngine::setReverbMacroDirect(2);         // 🌟 Room 3 (GM 기본 리버브 복구)
+            AudioEngine::setChorusMacroDirect(2);         // 🌟 Chorus 3 (기본 코러스 복구)
+            
+            // 새 곡에서 건드리지 않은 채널의 파라미터만 선별 기본값(Default) 100% 완전 복구!
+            for (int ch = 0; ch < 16; ch++) {
+              AudioEngine::controlChange(ch, 121, 0);
+
+              if (s_chExprSet[ch]) {
+                AudioEngine::controlChange(ch, 11, channels[ch].expression);
+              } else {
+                channels[ch].expression = 127;
+                AudioEngine::controlChange(ch, 11, 127);
+              }
+
+              if (s_chVolumeSet[ch]) {
+                AudioEngine::controlChange(ch, 7, channels[ch].volume);
+              } else {
+                channels[ch].volume = 100;
+                AudioEngine::controlChange(ch, 7, 100);
+              }
+
+              if (s_chPanSet[ch]) {
+                // 이미 수신된 Pan 유지
+              } else {
+                AudioEngine::controlChange(ch, 10, 64);
+              }
+
+              if (s_chBankSet[ch]) {
+                // 이미 수신된 Bank 유지
+              } else {
+                if (ch != 9) AudioEngine::setBank(ch, 0);
+              }
+
+              if (s_chProgSet[ch]) {
+                AudioEngine::programChange(ch, channels[ch].program);
+              } else {
+                if (ch != 9) AudioEngine::programChange(ch, 0);
+              }
+
+              AudioEngine::setPitchRange(ch, 2.0f);
+            }
+          }
+        }
+        s_sessionActive = true; // 세션 모드 잠금(Lock)! 연주 도중 핑퐁 차단
+      }
+
+      s_hasPlayedNotes = true; // 실제 음표 연주 시작 확정!
       AudioEngine::noteOn(channel, note, vel);
       DisplayUI::wakeup();
       channels[channel].vuLevel = (uint8_t)(vel / 8); // 벨로시티 높이 (2 ~ 16)
@@ -466,7 +713,8 @@ void MIDIParser::processCompleteMessage() {
   case 0xC0: { // Program Change (악기 변경)
     uint8_t prog = msgBuffer[1];
     channels[channel].program = prog;
-    AudioEngine::programChangeDirect(channel, prog); // [수정] Mutex 타임아웃 없는 Direct 호출
+    s_chProgSet[channel] = true;
+    AudioEngine::programChange(channel, prog); // TSF Mutex 보호 적용
     lastActiveChannel = channel;
     break;
   }
@@ -476,55 +724,100 @@ void MIDIParser::processCompleteMessage() {
     
     // Bank Select MSB (CC 0)
     if (ctrl == 0) {
-      if (channel == 9) {
-        // 드럼 채널 CC 0 = 127 (GS CM-64/32 Kit)
-        if (val == 127 && g_synth_mode != SYNTH_MODE_MT32) {
-          MIDIParser::setSynthMode(SYNTH_MODE_GS);
-        }
-      } else {
-        /* [옵션: SysEx 없는 비표준 MT-32 파일 지원용 다중 채널 감지 로직]
-        // 멜로디 채널 3개 이상에서 Bank 127을 동시 요청할 때만 MT-32 모드로 전환
-        static uint16_t mt32BankMask = 0;
-        if (val == 127) {
-          mt32BankMask |= (1 << channel);
-          if (__builtin_popcount(mt32BankMask) >= 3 && g_synth_mode != SYNTH_MODE_MT32) {
-            MIDIParser::setSynthMode(SYNTH_MODE_MT32);
-            AudioEngine::applyMT32ModeDirect();
+      s_chBankSet[channel] = true;
+      if (g_synth_policy == SYNTH_POLICY_MANUAL && g_manual_sub_mode == MANUAL_MODE_GM && channel != 9) {
+        val = 0; // 수동 GM 모드일 때는 Bank 0 고정
+      }
+      AudioEngine::setBank(channel, val); // TSF Mutex 보호 적용
+      
+      // [프리롤 스마트 지문 감지]
+      if (!s_sessionActive && g_synth_policy == SYNTH_POLICY_AUTO) {
+        if ((channel != 9 && val > 0 && val < 127) || (channel == 9 && val == 127)) {
+          s_hasGSFingerprint = true;
+          if (g_synth_mode != SYNTH_MODE_GS) {
+            MIDIParser::setSynthMode(SYNTH_MODE_GS);
           }
-        } else {
-          mt32BankMask &= ~(1 << channel);
         }
-        */
-
-        // [기본 표준 동작] 
-        // 전체 시스템 모드를 뒤집지 않고, GS 모드를 유지한 채 해당 채널의 사운드폰트 Bank만 지정
-        if (val > 0 && g_synth_mode != SYNTH_MODE_MT32) {
-          MIDIParser::setSynthMode(SYNTH_MODE_GS);
-        }
-        AudioEngine::setBankDirect(channel, val);
       }
     }
 
-    if (ctrl == 7) channels[channel].volume = val;
-    if (ctrl == 11) channels[channel].expression = val;
+    if (ctrl == 7) {
+      channels[channel].volume = val;
+      s_chVolumeSet[channel] = true;
+    }
+    if (ctrl == 11) {
+      channels[channel].expression = val;
+      s_chExprSet[channel] = true;
+    }
+    if (ctrl == 10) {
+      s_chPanSet[channel] = true;
+    }
 
-    // RPN 등록
-    if (ctrl == 101) channelRPN[channel] = (channelRPN[channel] & 0x007F) | ((uint16_t)val << 7);
-    if (ctrl == 100) channelRPN[channel] = (channelRPN[channel] & 0x3F80) | (val & 0x7F);
+    // NRPN / RPN 등록 (8비트 MSB/LSB 결합)
+    if (ctrl == 99) { // NRPN MSB
+      channelNRPN[channel] = (channelNRPN[channel] & 0x00FF) | ((uint16_t)val << 8);
+      channelRPN[channel] = 0x7F7F;
 
-    if (ctrl == 99 || ctrl == 98) {
-      channelRPN[channel] = 0x7F7F; // NRPN 수신 시 RPN 무효화
+      // [프리롤 GS 지문 감지] 곡 시작 전 GS Drum Key NRPN (0x18, 0x1A, 0x1C, 0x1D) 또는 TVF/ENV NRPN (0x01) 수신 시!
+      if (!s_sessionActive) {
+        if (val == 0x01 || val == 0x18 || val == 0x1A || val == 0x1C || val == 0x1D) {
+          s_hasGSFingerprint = true;
+          if (g_synth_mode != SYNTH_MODE_GS) {
+            MIDIParser::setSynthMode(SYNTH_MODE_GS);
+          }
+        }
+      }
+    }
+    if (ctrl == 98) { // NRPN LSB
+      channelNRPN[channel] = (channelNRPN[channel] & 0xFF00) | (val & 0x7F);
+      channelRPN[channel] = 0x7F7F;
+    }
+    if (ctrl == 101) { // RPN MSB
+      channelRPN[channel] = (channelRPN[channel] & 0x00FF) | ((uint16_t)val << 8);
+      channelNRPN[channel] = 0x7F7F;
+    }
+    if (ctrl == 100) { // RPN LSB
+      channelRPN[channel] = (channelRPN[channel] & 0xFF00) | (val & 0x7F);
+      channelNRPN[channel] = 0x7F7F;
     }
 
     if (ctrl == 6) { // Data Entry MSB
       if (channelRPN[channel] == 0x0000) { // Pitch Bend Sensitivity (RPN 00 00)
         uint8_t range = (val > 24) ? 24 : val;
         AudioEngine::setPitchRange(channel, (float)range);
-        channelRPN[channel] = 0x7F7F;
+      } else if (channelNRPN[channel] == 0x0108) { // Vibrato Rate
+        AudioEngine::controlChange(channel, 76, val);
+      } else if (channelNRPN[channel] == 0x0109) { // Vibrato Depth
+        AudioEngine::controlChange(channel, 77, val);
+      } else if (channelNRPN[channel] == 0x010A) { // Vibrato Delay
+        AudioEngine::controlChange(channel, 78, val);
+      } else if (channelNRPN[channel] == 0x0120) { // TVF Cutoff Frequency
+        AudioEngine::controlChange(channel, 74, val);
+      } else if (channelNRPN[channel] == 0x0121) { // TVF Resonance
+        AudioEngine::controlChange(channel, 71, val);
+      } else if (channelNRPN[channel] == 0x0163) { // Envelope Attack Time
+        AudioEngine::controlChange(channel, 73, val);
+      } else if (channelNRPN[channel] == 0x0164) { // Envelope Decay Time
+        AudioEngine::controlChange(channel, 75, val);
+      } else if (channelNRPN[channel] == 0x0166) { // Envelope Release Time
+        AudioEngine::controlChange(channel, 72, val);
+      } else if ((channelNRPN[channel] >> 8) == 0x18) { // Drum Key Pitch Coarse
+        uint8_t dKey = channelNRPN[channel] & 0x7F;
+        AudioEngine::setDrumKeyPitchDirect(dKey, (int8_t)val - 64);
+      } else if ((channelNRPN[channel] >> 8) == 0x1A) { // Drum Key TVF Cutoff
+        uint8_t dKey = channelNRPN[channel] & 0x7F;
+        AudioEngine::setDrumKeyCutoffDirect(dKey, (int8_t)val - 64);
+      } else if ((channelNRPN[channel] >> 8) == 0x1C) { // Drum Key Level
+        uint8_t dKey = channelNRPN[channel] & 0x7F;
+        AudioEngine::setDrumKeyLevelDirect(dKey, val);
+      } else if ((channelNRPN[channel] >> 8) == 0x1D) { // Drum Key Panpot
+        uint8_t dKey = channelNRPN[channel] & 0x7F;
+        AudioEngine::setDrumKeyPanDirect(dKey, val);
       }
     }
     if (ctrl == 121) {
       channelRPN[channel] = 0x7F7F;
+      channelNRPN[channel] = 0x7F7F;
     }
     if (ctrl == 120 || ctrl == 123) {
       channels[channel].vuLevel = 0;
@@ -574,6 +867,13 @@ void MIDIParser::parseByte(uint8_t b) {
     return;
   }
 
+  // System Common 메시지 (0xF1 ~ 0xF6)는 Running Status를 리셋하고 무시
+  if (b >= 0xF1 && b <= 0xF6) {
+    runningStatus = 0;
+    msgIndex = 0;
+    return;
+  }
+
   // 1. SysEx 수신 중이거나 0xF0가 들어온 경우
   if (inSysEx || b == 0xF0) {
     parseSysExByte(b);
@@ -583,12 +883,13 @@ void MIDIParser::parseByte(uint8_t b) {
       return;
   }
 
-  // 2. F0 없이 들어오는 Roland Raw SysEx Escape (0x41 0x10 0x16 ...) 감지
+  // 2. F0 없이 들어오는 Roland Raw SysEx Escape (0x41 0x10 0x16 ...) 감지 (가상 0xF0 전치로 오프셋 일치)
   if (msgIndex == 0 && runningStatus == 0 && b == 0x41) {
     inSysEx = true;
     sysexOverflow = false;
     sysexLen = 0;
-    sysexBuf[sysexLen++] = b;
+    sysexBuf[sysexLen++] = 0xF0;
+    sysexBuf[sysexLen++] = 0x41;
     lastMidiEventTime = millis();
     return;
   }
@@ -637,6 +938,7 @@ void MIDIParser::parseSysExByte(uint8_t b) {
     if (b == 0xF7 || (b & 0x80)) {
       inSysEx = false;
       lastMidiEventTime = millis();
+      DEBUG_RECORD_SYSEX(sysexLen, sysexOverflow);
       if (sysexOverflow) {
         sysexLen = 0;
         sysexOverflow = false;
@@ -663,18 +965,19 @@ void MIDIParser::parseSysExByte(uint8_t b) {
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x10 &&
                  sysexBuf[6] == 0x00 && sysexBuf[7] == 0x01) {
         // Roland MT-32 Reverb Parameter SysEx
+        s_hasMT32Fingerprint = true;
         MIDIParser::setSynthMode(SYNTH_MODE_MT32);
         AudioEngine::setMT32ReverbDirect(
             sysexBuf[8], sysexBuf[9], (sysexLen >= 13 ? sysexBuf[10] : 64));
       } else if (sysexLen >= 14 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
                  sysexBuf[4] == 0x12 &&
-                 (sysexBuf[5] == 0x04 || sysexBuf[5] == 0x05 ||
-                  sysexBuf[5] == 0x08)) {
-        // Roland MT-32 Timbre Temp / Patch Temp Memory Dump (체크섬 없이 즉시 모드 적용)
+                 (sysexBuf[5] == 0x04 || sysexBuf[5] == 0x08)) {
+        // Roland MT-32 Timbre Temp / User Timbre Memory Dump (14 ~ 256바이트 파셜 음색 덤프)
+        s_hasMT32Fingerprint = true;
         MIDIParser::setSynthMode(SYNTH_MODE_MT32);
         AudioEngine::applyMT32ModeDirect();
 
-        uint8_t targetPart = sysexBuf[6] & 0x07; // Part 1~8 -> Channel 1~8
+        uint8_t targetPart = sysexBuf[6] & 0x07; // Part 1~8 -> Channel 1~8 (Ch 2~9)
         uint8_t targetCh = targetPart + 1;       // MT-32 Part 1 = MIDI Ch 2(index 1)
         SemaphoreHandle_t mutex = AudioEngine::getMutex();
         if (mutex)
@@ -683,10 +986,11 @@ void MIDIParser::parseSysExByte(uint8_t b) {
                                          sysexLen - 9);
         if (mutex)
           xSemaphoreGive(mutex);
-      } else if (sysexLen >= 14 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
-                 sysexBuf[4] == 0x12 && sysexBuf[5] == 0x05 &&
+      } else if (sysexLen >= 14 && sysexLen < 60 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16 &&
+                 sysexBuf[4] == 0x12 && (sysexBuf[5] == 0x03 || sysexBuf[5] == 0x05) &&
                  (sysexBuf[7] == 0x00 || sysexBuf[7] == 0x02)) {
         // Roland MT-32 Patch Temp Memory (Key Shift, Fine Tune, Bender Range)
+        s_hasMT32Fingerprint = true;
         MIDIParser::setSynthMode(SYNTH_MODE_MT32);
         AudioEngine::applyMT32ModeDirect();
 
@@ -706,6 +1010,7 @@ void MIDIParser::parseSysExByte(uint8_t b) {
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x03 &&
                  sysexBuf[6] == 0x01 && sysexBuf[7] == 0x10) {
         // Roland MT-32 Rhythm Temp
+        s_hasMT32Fingerprint = true;
         uint8_t key = sysexBuf[8];
         uint8_t level = (sysexLen >= 13) ? sysexBuf[10] : 100;
         uint8_t pan = (sysexLen >= 14) ? sysexBuf[11] : 7;
@@ -713,14 +1018,19 @@ void MIDIParser::parseSysExByte(uint8_t b) {
         AudioEngine::setDrumKeyPanDirect(key, pan);
       } else if (sysexLen >= 6 && sysexBuf[1] == 0x7E && sysexBuf[3] == 0x09 &&
                  (sysexBuf[4] == 0x01 || sysexBuf[4] == 0x03)) {
-        // GM1 / GM2 System On
-        MIDIParser::setSynthMode((sysexBuf[4] == 0x03) ? SYNTH_MODE_GM2 : SYNTH_MODE_GM);
-        AudioEngine::applyGMModeDirect();
-        AudioEngine::systemReset();
-        clearAllVU();
+        // GM1 / GM2 System On -> GM 모드로 통일
+        if (g_synth_policy == SYNTH_POLICY_AUTO) {
+          s_hasMT32Fingerprint = false;
+          s_hasGSFingerprint = false;
+          MIDIParser::setSynthMode(SYNTH_MODE_GM);
+          AudioEngine::applyGMModeDirect();
+          AudioEngine::systemReset();
+          clearAllVU();
+        }
       } else if (sysexLen >= 5 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x16) {
         // Roland MT-32 SysEx (F0 41 <dev> 16 ...)
-        if (g_synth_mode != SYNTH_MODE_MT32) {
+        s_hasMT32Fingerprint = true;
+        if (g_synth_policy == SYNTH_POLICY_AUTO && g_synth_mode != SYNTH_MODE_MT32) {
           MIDIParser::setSynthMode(SYNTH_MODE_MT32);
           AudioEngine::applyMT32ModeDirect();
           clearAllVU();
@@ -729,10 +1039,14 @@ void MIDIParser::parseSysExByte(uint8_t b) {
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x00 && sysexBuf[7] == 0x7F) {
         // Roland GS Reset
-        MIDIParser::setSynthMode(SYNTH_MODE_GS);
-        AudioEngine::applyGSModeDirect();
-        AudioEngine::systemReset();
-        clearAllVU();
+        s_hasGSFingerprint = true;
+        s_lastGSResetTime = millis();
+        if (g_synth_policy == SYNTH_POLICY_AUTO) {
+          MIDIParser::setSynthMode(SYNTH_MODE_GS);
+          AudioEngine::applyGSModeDirect();
+          AudioEngine::systemReset();
+          clearAllVU();
+        }
       } else if (sysexLen >= 12 && sysexBuf[1] == 0x41 && sysexBuf[3] == 0x42 &&
                  sysexBuf[4] == 0x12 && sysexBuf[5] == 0x40 &&
                  sysexBuf[6] == 0x02 && sysexBuf[7] == 0x00) {
@@ -876,35 +1190,15 @@ void MIDIParser::clearAllVU() {
 }
 
 void MIDIParser::update() {
-  // 1. UART 수신 버퍼 처리
-  int avail = SerialMIDI.available();
-  if (avail > 0) {
-    if (avail > 256)
-      avail = 256;
-    uint8_t rxBuf[256];
-    int count = SerialMIDI.readBytes(rxBuf, avail);
-    for (int i = 0; i < count; i++) {
-      parseByte(rxBuf[i]);
-    }
-  }
+  uint32_t now = millis();
 
-  // 시리얼 무신호 2초 감지 시 GM 모드로 자동 복구
-  if (lastMidiEventTime > 0 && (millis() - lastMidiEventTime >= 2000)) {
-    if (g_synth_mode != SYNTH_MODE_GM) {
-      MIDIParser::setSynthMode(SYNTH_MODE_GM);
-      AudioEngine::applyGMModeDirect();
-      clearAllVU();
-    }
-    lastMidiEventTime = 0;
-  }
-
-  // 3. VU 미터 부드러운 감쇠 루틴 (35ms 주기)
+  // VU 미터 부드러운 감쇠 루틴 (35ms 주기)
   static unsigned long lastDecayTime = 0;
-  if (millis() - lastDecayTime >= 35) {
-    lastDecayTime = millis();
+  if (now - lastDecayTime >= 35) {
+    lastDecayTime = now;
     for (int i = 0; i < 16; i++) {
       if (channels[i].vuLevel > 0) {
-        if (millis() - channels[i].lastNoteTime > 120) {
+        if (now - channels[i].lastNoteTime > 120) {
           if (channels[i].vuLevel > 2)
             channels[i].vuLevel -= 2;
           else

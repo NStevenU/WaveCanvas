@@ -508,11 +508,11 @@ struct tsf_channels
 	struct tsf_channel channels[1];
 };
 
-static float tsf_timecents2Secsd(float timecents) { return TSF_POWF(2.0f, timecents / 1200.0f); }
-static float tsf_timecents2Secsf(float timecents) { return TSF_POWF(2.0f, timecents / 1200.0f); }
-static float tsf_cents2Hertz(float cents) { return 8.176f * TSF_POWF(2.0f, cents / 1200.0f); }
-static float tsf_decibelsToGain(float db) { return (db > -100.f ? TSF_POWF(10.0f, db * 0.05f) : 0); }
-static float tsf_gainToDecibels(float gain) { return (gain <= .00001f ? -100.f : (20.0f * TSF_LOG10F(gain))); }
+static inline float tsf_timecents2Secsd(float timecents) { return exp2f(timecents * (1.0f / 1200.0f)); }
+static inline float tsf_timecents2Secsf(float timecents) { return exp2f(timecents * (1.0f / 1200.0f)); }
+static inline float tsf_cents2Hertz(float cents) { return 8.176f * exp2f(cents * (1.0f / 1200.0f)); }
+static inline float tsf_decibelsToGain(float db) { return (db > -100.f ? expf(db * 0.1151292546497f) : 0.0f); }
+static inline float tsf_gainToDecibels(float gain) { return (gain <= .00001f ? -100.f : (8.685889638f * logf(gain))); }
 
 static TSF_BOOL tsf_riffchunk_read(struct tsf_riffchunk* parent, struct tsf_riffchunk* chunk, struct tsf_stream* stream)
 {
@@ -1058,7 +1058,8 @@ static int tsf_load_samples(short** pShortBuffer, unsigned int* pSmplCount, stru
 	int readBytes = stream->read(stream->data, *pShortBuffer, chunkSmpl->size);
 	Serial.printf("[TSF] Read sample stream: %d / %u bytes (Free PSRAM: %u KB)\n",
 	              readBytes, chunkSmpl->size, (unsigned int)(ESP.getFreePsram() / 1024));
-	if (readBytes <= 0) {
+	if (readBytes <= 0 || (unsigned int)readBytes < chunkSmpl->size) {
+		Serial.println("[TSF] Error: Incomplete sample data read from stream!");
 		DisplayUI::showToast(DisplayUI::isKoreanMode() ? "에러: 샘플 읽기 실패" : "Err: Sample Read", 3000);
 		return 0;
 	}
@@ -1087,6 +1088,7 @@ static void tsf_voice_envelope_nextsegment(struct tsf_voice_envelope* e, short a
 			/* fall through */
 		case TSF_SEGMENT_DELAY:
 			e->samplesUntilNextSegment = (int)(e->parameters.attack * outSampleRate);
+			if (e->isAmpEnv && e->samplesUntilNextSegment < 8) e->samplesUntilNextSegment = 8; // 최소 8샘플(0.18ms) 안티클릭 소프트 어택 보장 (틱 노이즈 100% 제거)
 			if (e->samplesUntilNextSegment > 0)
 			{
 				if (!e->isAmpEnv)
@@ -1225,7 +1227,7 @@ static void tsf_voice_lowpass_setup(struct tsf_voice_lowpass* e, float Fc)
     e->b2 = (1.0f - K * e->QInv + KK) * norm;
 }
 
-static float tsf_voice_lowpass_process(struct tsf_voice_lowpass* e, float In)
+static inline float tsf_voice_lowpass_process(struct tsf_voice_lowpass* e, float In)
 {
 	float Out = In * e->a0 + e->z1;
 	e->z1 = In * e->a1 + e->z2 - e->b1 * Out;
@@ -1265,6 +1267,8 @@ static void tsf_voice_kill(struct tsf_voice* v)
 	v->playIndex = 0;
 	v->heldSustain = 0;
 	v->heldSostenuto = 0;
+	v->lowpass.z1 = 0.0f;
+	v->lowpass.z2 = 0.0f;
 	v->ampenv.segment = TSF_SEGMENT_DONE;
 	v->ampenv.level = 0.0f;
 	v->ampenv.slope = 0.0f;
@@ -1414,70 +1418,141 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 		{
 			case TSF_STEREO_INTERLEAVED:
 				gainLeft = gainMono * v->panFactorLeft, gainRight = gainMono * v->panFactorRight;
-				while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+				if (tmpLowpass.active)
 				{
-					unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
-					unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
-					float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
-					float s0 = (float)input[pos];
-					float s1 = (float)input[nextPos];
-					float val = s0 + alpha * (s1 - s0);
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
 
-					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
+						val = tsf_voice_lowpass_process(&tmpLowpass, val);
 
-					*outL++ += val * gainLeft;
-					*outL++ += val * gainRight;
+						*outL++ += val * gainLeft;
+						*outL++ += val * gainRight;
 
-					tmpSourceSamplePosition += pitchRatioFP;
-					if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
-    					// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
-    					tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
+					}
+				}
+				else
+				{
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
+
+						*outL++ += val * gainLeft;
+						*outL++ += val * gainRight;
+
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
 					}
 				}
 				break;
 
 			case TSF_STEREO_UNWEAVED:
 				gainLeft = gainMono * v->panFactorLeft, gainRight = gainMono * v->panFactorRight;
-				while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+				if (tmpLowpass.active)
 				{
-					unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
-					unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
-					float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
-					float s0 = (float)input[pos];
-					float s1 = (float)input[nextPos];
-					float val = s0 + alpha * (s1 - s0);
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
 
-					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
+						val = tsf_voice_lowpass_process(&tmpLowpass, val);
 
-					*outL++ += val * gainLeft;
-					*outR++ += val * gainRight;
+						*outL++ += val * gainLeft;
+						*outR++ += val * gainRight;
 
-					tmpSourceSamplePosition += pitchRatioFP;
-					if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
-    					// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
-    					tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
+					}
+				}
+				else
+				{
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
+
+						*outL++ += val * gainLeft;
+						*outR++ += val * gainRight;
+
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
 					}
 				}
 				break;
 
 			case TSF_MONO:
-				while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+				if (tmpLowpass.active)
 				{
-					unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
-					unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
-					float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
-					float s0 = (float)input[pos];
-					float s1 = (float)input[nextPos];
-					float val = s0 + alpha * (s1 - s0);
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
 
-					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
+						val = tsf_voice_lowpass_process(&tmpLowpass, val);
 
-					*outL++ += val * gainMono;
+						*outL++ += val * gainMono;
 
-					tmpSourceSamplePosition += pitchRatioFP;
-					if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
-    					// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
-    					tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
+					}
+				}
+				else
+				{
+					while (blockSamples-- && tmpSourceSamplePosition < tmpSampleEndFP)
+					{
+						unsigned int pos = (unsigned int)(tmpSourceSamplePosition >> 32);
+						unsigned int nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
+						float alpha = (float)(uint32_t)(tmpSourceSamplePosition & 0xFFFFFFFF) * (1.0f / 4294967296.0f);
+						float s0 = (float)input[pos];
+						float s1 = (float)input[nextPos];
+						float val = s0 + alpha * (s1 - s0);
+
+						*outL++ += val * gainMono;
+
+						tmpSourceSamplePosition += pitchRatioFP;
+						if (isLooping && tmpSourceSamplePosition >= tmpLoopEndFP) {
+							// 루프 길이가 극도로 짧아 단번에 여러 주기를 건너뛰더라도 정확하게 루프 안으로 복귀
+							tmpSourceSamplePosition = tmpLoopStartFP + ((tmpSourceSamplePosition - tmpLoopStartFP) % tmpLoopLenFP);
+						}
 					}
 				}
 				break;
@@ -1810,20 +1885,64 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 				}
 				if (!voice)
 				{
-					// If no voice in release, steal the oldest playing voice (lowest playIndex)
+					// [2단계] Release 중인 보이스가 전혀 없을 때 (32개 건반을 모두 누르고 있는 상황):
+					// 🛡️ 새로 켜진 음표(ATTACK/DELAY) 및 웅장하게 울리는 활성 메인 지속음(Strings/Pad/Lead: level >= 0.15)은 절대 보호!
+					// ➔ 소리가 거의 다 꺼진 배경 감쇠음(DECAY 중 level < 0.15)부터 안전하게 회수!
 					unsigned int oldestPlayIndex = 0xFFFFFFFF;
 					for (v = f->voices; v != vEnd; v++)
 					{
-						if (v->playIndex < oldestPlayIndex)
+						if (v->ampenv.segment >= TSF_SEGMENT_DECAY && v->ampenv.level < 0.15f)
 						{
-							oldestPlayIndex = v->playIndex;
-							voice = v;
+							if (v->playIndex < oldestPlayIndex)
+							{
+								oldestPlayIndex = v->playIndex;
+								voice = v;
+							}
+						}
+					}
+
+					// 만약 모든 보이스가 0.15 이상으로 울리고 있을 때는 가장 오래된 DECAY/SUSTAIN 음표 중 최저 볼륨 선택
+					if (!voice)
+					{
+						oldestPlayIndex = 0xFFFFFFFF;
+						float lowestLevel = 999999.0f;
+						for (v = f->voices; v != vEnd; v++)
+						{
+							if (v->ampenv.segment >= TSF_SEGMENT_DECAY)
+							{
+								if (v->playIndex < oldestPlayIndex)
+								{
+									oldestPlayIndex = v->playIndex;
+									lowestLevel = v->ampenv.level;
+									voice = v;
+								}
+								else if (v->playIndex == oldestPlayIndex && v->ampenv.level < lowestLevel)
+								{
+									lowestLevel = v->ampenv.level;
+									voice = v;
+								}
+							}
+						}
+					}
+
+					// 예외 폴백: 모든 보이스가 어택 중인 극단적 상황 시 가장 오래된 보이스 선택
+					if (!voice)
+					{
+						unsigned int oldestFallback = 0xFFFFFFFF;
+						for (v = f->voices; v != vEnd; v++)
+						{
+							if (v->playIndex < oldestFallback)
+							{
+								oldestFallback = v->playIndex;
+								voice = v;
+							}
 						}
 					}
 				}
 				if (!voice)
 					continue;
 				tsf_voice_kill(voice);
+				DEBUG_RECORD_VOICE_STEAL();
 			}
 			else
 			{
@@ -1967,6 +2086,10 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		// Setup lowpass filter (SoundFont 2.04 Standard)
         float cutoffCents = (float)region->initialFilterFc;
         if (curChan) cutoffCents += (float)curChan->filterCutoffOffset;
+        extern int8_t g_drum_cutoff[128];
+        if (curChan && curChan->isDrum && (key >= 0 && key < 128)) {
+            cutoffCents += (float)(g_drum_cutoff[key] * 50); // -64..+63 -> -3200..+3150 cents
+        }
         if (cutoffCents < 400.0f) cutoffCents = 400.0f;
         if (cutoffCents > 13500.0f) cutoffCents = 13500.0f;
         voice->lowpassCutoffCents = cutoffCents;
@@ -2319,6 +2442,14 @@ TSFDEF int tsf_channel_set_presetnumber(tsf* f, int channel, int preset_number, 
 	int preset_index = -1;
 	struct tsf_channel *c = tsf_channel_init(f, channel);
 	if (!c) return 0;
+	// 새 악기 번호 지정 시 직전 곡의 NRPN 필터 컷오프/레조넌스/엔벨로프 오프셋 초기화
+	c->filterCutoffOffset = 0;
+	c->filterResonanceOffset = 0;
+	c->attackOffset = 0;
+	c->decayOffset = 0;
+	c->releaseOffset = 0;
+	c->nrpnParam = 0xFFFF;
+
 	if (flag_mididrums || c->isDrum)
 	{
 		// 1) 128 | Bank MSB (GS Drum Sets)
@@ -2488,20 +2619,17 @@ TSFDEF int tsf_channel_note_on(tsf* f, int channel, int key, float vel)
 	}
 	int presetIndex = f->channels->channels[channel].presetIndex;
 
-	// [수정] 오직 MT-32 모드이면서 Bank가 127(MT-32 기본 드럼 뱅크) 또는 0일 때만 Standard/CM-64 킷으로 라우팅!
-	// GS 곡에서 Program Change로 지정한 Power(16), Electronic(24), Dance(25) 드럼 키트는 프리셋 유지!
+	// [수정] 오직 MT-32 모드이면서 (channel == 9 || isDrum)일 때:
+	// 35~81번 타악기 키는 Standard 드럼 키트(Preset 128)로, 그 외 키(효과음)는 CM-64 셋으로 100% 라우팅!
 	if (MIDIParser::getSynthMode() == SYNTH_MODE_MT32 && (channel == 9 || f->channels->channels[channel].isDrum))
 	{
-		if (f->channels->channels[channel].bank == 127 || f->channels->channels[channel].bank == 0)
+		if (key >= 35 && key <= 81)
 		{
-			if (key >= 35 && key <= 81)
-			{
-				if (f->mt32StdDrumIndex != -1) presetIndex = f->mt32StdDrumIndex;
-			}
-			else
-			{
-				if (f->mt32CmDrumIndex != -1) presetIndex = f->mt32CmDrumIndex;
-			}
+			if (f->mt32StdDrumIndex != -1) presetIndex = f->mt32StdDrumIndex;
+		}
+		else
+		{
+			if (f->mt32CmDrumIndex != -1) presetIndex = f->mt32CmDrumIndex;
 		}
 	}
 	return tsf_note_on(f, presetIndex, key, vel);
@@ -2509,38 +2637,60 @@ TSFDEF int tsf_channel_note_on(tsf* f, int channel, int key, float vel)
 
 TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key)
 {
-	unsigned sustain;
-	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum, *vMatchFirst = TSF_NULL, *vMatchLast = TSF_NULL;
 	if (!f->channels || channel >= f->channels->channelNum) return;
-	// MIDI 1.0 & Roland 표준: 드럼/타악기 채널은 Note-Off를 무시하고 자연 감쇠(One-Shot)로 끝까지 연주
-	if (channel == 9 || f->channels->channels[channel].isDrum) return;
 
-	for (; v != vEnd; v++)
+	TSF_BOOL isDrumChan = (channel == 9 || f->channels->channels[channel].isDrum);
+	TSF_BOOL isSFXKey = (f->channels->channels[channel].presetIndex == 56 || key == 58 || key == 67 || key == 70 || key == 73);
+
+	// 일반 원샷 드럼(Standard/Room/Power 킷: 킥, 스네어, 심벌 등)은 실기 표준대로 Note-Off 무시 (자연 감쇠 펀치 100% 보존!)
+	// 오직 SFX 세트(박수소리 등 지속형 루프) 및 멜로디 악기만 Note-Off 정상 처리!
+	if (isDrumChan && !isSFXKey)
 	{
-		//Find the first and last entry in the voices list with matching channel, key and look up the smallest play index
-		if (v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE || v->heldSustain) continue;
-		else if (!vMatchFirst || v->playIndex < vMatchFirst->playIndex) vMatchFirst = vMatchLast = v;
-		else if (v->playIndex == vMatchFirst->playIndex) vMatchLast = v;
+		return;
 	}
-	if (!vMatchFirst) return;
-	for (sustain = f->channels->channels[channel].sustain, v = vMatchFirst; v <= vMatchLast; v++)
+
+	unsigned sustain = f->channels->channels[channel].sustain;
+	struct tsf_voice *v, *vEnd = f->voices + f->voiceNum;
+	unsigned int targetPlayIndex = 0xFFFFFFFF;
+
+	// 1단계: 실기(Roland SC-55) 표준 FIFO - 해당 (channel, key)에서 현재 발음 중인 가장 오래된 Note-On의 playIndex 탐색
+	for (v = f->voices; v != vEnd; v++)
 	{
-		//Stop all voices with matching channel, key and the smallest play index which was enumerated above
-		if (v != vMatchFirst && v != vMatchLast &&
-			(v->playIndex != vMatchFirst->playIndex || v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE)) continue;
-		//Don't turn off if sustain/sostenuto is active, just mark as held
-		if (sustain || v->heldSostenuto)
-			v->heldSustain = 1;
-		else
-			tsf_voice_end(f, v);
+		if (v->playingPreset != -1 && v->playingChannel == channel && v->playingKey == key && v->ampenv.segment < TSF_SEGMENT_RELEASE && !v->heldSustain)
+		{
+			if (v->playIndex < targetPlayIndex)
+			{
+				targetPlayIndex = v->playIndex;
+			}
+		}
+	}
+
+	if (targetPlayIndex == 0xFFFFFFFF) return;
+
+	// 2단계: 그 정확한 playIndex에 속한 모든 레이어(스테레오 L/R 등) 보이스들을 찾아 안전하게 Note-Off 처리
+	for (v = f->voices; v != vEnd; v++)
+	{
+		if (v->playingPreset != -1 && v->playingChannel == channel && v->playingKey == key && v->playIndex == targetPlayIndex && v->ampenv.segment < TSF_SEGMENT_RELEASE && !v->heldSustain)
+		{
+			if (sustain || v->heldSostenuto)
+				v->heldSustain = 1;
+			else
+				tsf_voice_end(f, v);
+		}
 	}
 }
 
 TSFDEF void tsf_channel_note_off_all(tsf* f, int channel)
 {
 	if (!f->channels || channel >= f->channels->channelNum) return;
-	// MIDI 1.0 & Roland 표준: 드럼 채널은 CC 123(All Notes Off)을 100% 무시
-	if (channel == 9 || f->channels->channels[channel].isDrum) return;
+
+	// 🌟 Roland SC-55 / MT-32 실기 표준: 일반 타악기 드럼 채널은 All Notes Off (CC 123) 무시!
+	// (G17.MID 등 2,522번 CC 123 쏟아지는 곡에서 2,232개 하이햇/심벌이 5ms 만에 싹둑 잘리는 문제 원천 차단)
+	// 단, 지속형 루프 사운드인 SFX 드럼 킷(Preset 56 - 박수소리, 사이렌)만 Note-Off 수용!
+	if ((channel == 9 || f->channels->channels[channel].isDrum) && f->channels->channels[channel].presetIndex != 56)
+	{
+		return;
+	}
 
 	unsigned sustain = f->channels->channels[channel].sustain;
 	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
@@ -2548,7 +2698,6 @@ TSFDEF void tsf_channel_note_off_all(tsf* f, int channel)
 	{
 		if (v->playingPreset != -1 && v->playingChannel == channel && v->ampenv.segment < TSF_SEGMENT_RELEASE)
 		{
-			// MIDI 1.0 표준: 서스테인 페달(CC 64) 또는 소스테누토(CC 66)가 켜져 있으면 소리를 유지
 			if (sustain || v->heldSostenuto)
 				v->heldSustain = 1;
 			else
@@ -2609,8 +2758,9 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 					uint8_t nrpnMsb = (uint8_t)(c->nrpnParam >> 8);
 					uint8_t drumKey = (uint8_t)(c->nrpnParam & 0x7F);
 					if (nrpnMsb == 0x18) { AudioEngine::setDrumKeyPitchDirect(drumKey, (int8_t)control_value - 64); return 1; }
-					else if (nrpnMsb == 0x1A) { AudioEngine::setDrumKeyLevelDirect(drumKey, (uint8_t)control_value); return 1; }
-					else if (nrpnMsb == 0x1C) { AudioEngine::setDrumKeyPanDirect(drumKey, (uint8_t)control_value); return 1; }
+					else if (nrpnMsb == 0x1A) { AudioEngine::setDrumKeyCutoffDirect(drumKey, (int8_t)control_value - 64); return 1; }
+					else if (nrpnMsb == 0x1C) { AudioEngine::setDrumKeyLevelDirect(drumKey, (uint8_t)control_value); return 1; }
+					else if (nrpnMsb == 0x1D) { AudioEngine::setDrumKeyPanDirect(drumKey, (uint8_t)control_value); return 1; }
 				}
 				return 1; // 지원하지 않는 NRPN은 RPN으로 흘리지 않고 안전하게 종료!
 			}
@@ -2658,9 +2808,9 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 		case 124 /*OMNI_OFF*/        :
 		case 125 /*OMNI_ON*/         : tsf_channel_note_off_all(f, channel);   return 1;
 		case 121 /*ALL_CTRL_OFF*/    :
-			c->midiVolume = c->midiExpression = 16383;
-			c->midiPan = 8192;
-			c->bank = (MIDIParser::getSynthMode() == SYNTH_MODE_MT32 && channel != 9) ? 127 : 0;
+			// 🌟 Roland SC-55 / MT-32 & MIDI 1.0 표준: Volume(CC 7), Pan(CC 10), Program/Bank는 유지!
+			// Expression(CC 11), Pitch Bend(0), Modulation(0), Sustain(0), NRPN(0xFFFF)만 리셋
+			c->midiExpression = 16383;
 			c->midiRPN = 0xFFFF;
 			c->midiData = 0;
 			c->pitchWheel = 8192;
@@ -2674,14 +2824,11 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 			c->nrpnParam = 0xFFFF;
 			c->portamentoOn = 0;
 			c->portamentoTime = 0;
-			c->reverbSend = (channel == 9 ? 0 : 40);
-			c->chorusSend = 0;
 			c->isMono = 0;
 			c->modDepth = 50.0f;
 			memset(c->scaleTuning, 0, sizeof(c->scaleTuning));
 			c->tuningOffset = 0.0f;
-			tsf_channel_set_volume(f, channel, 1.0f);
-			tsf_channel_set_pan(f, channel, 0.5f);
+			tsf_channel_set_volume(f, channel, TSF_POWF((c->midiVolume / 16383.0f), 2.0f));
 			tsf_channel_set_pitchrange(f, channel, (MIDIParser::getSynthMode() == SYNTH_MODE_MT32) ? 12.0f : 2.0f);
 			tsf_channel_set_tuning(f, channel, 0);
 			tsf_channel_applypitch(f, channel, c);

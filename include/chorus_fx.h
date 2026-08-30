@@ -149,17 +149,19 @@ public:
         const float fb = feedback;
         const float step8 = lfoRate8;
 
-        float* ptr = buffer;
+        int wIdx = writeIdx;
+        float phase = lfoPhase;
         float curDelayL = delayBase;
         float curDelayR = delayBase;
 
+        float* ptr = buffer;
         for (int i = 0; i < numFrames; i++) {
             // LFO는 0.2~2.8Hz 극저주파이므로 8샘플마다 1회만 FPU 삼각함수 연산 (연산량 87.5% 대폭 절감!)
             if ((i & 7) == 0) {
-                float modL = sinf(lfoPhase);
-                float modR = cosf(lfoPhase);
-                lfoPhase += step8;
-                if (lfoPhase >= 6.2831853f) lfoPhase -= 6.2831853f;
+                float modL = sinf(phase);
+                float modR = cosf(phase);
+                phase += step8;
+                if (phase >= 6.2831853f) phase -= 6.2831853f;
 
                 curDelayL = delayBase + (depth * modL);
                 curDelayR = delayBase + (depth * modR);
@@ -168,8 +170,10 @@ public:
             float inL = ptr[0];
             float inR = ptr[1];
 
+            float basePos = (float)(wIdx + (CHORUS_BUF_SIZE * 4));
+
             // Left Channel Read with Linear Interpolation & Bitmask Modulo
-            float readPosL = (float)writeIdx - curDelayL + (float)(CHORUS_BUF_SIZE * 4);
+            float readPosL = basePos - curDelayL;
             int rIdxL1 = (int)readPosL;
             float fracL = readPosL - (float)rIdxL1;
             rIdxL1 &= MASK;
@@ -177,7 +181,7 @@ public:
             float delayedL = bufL[rIdxL1] + fracL * (bufL[rIdxL2] - bufL[rIdxL1]);
 
             // Right Channel Read with Linear Interpolation & Bitmask Modulo
-            float readPosR = (float)writeIdx - curDelayR + (float)(CHORUS_BUF_SIZE * 4);
+            float readPosR = basePos - curDelayR;
             int rIdxR1 = (int)readPosR;
             float fracR = readPosR - (float)rIdxR1;
             rIdxR1 &= MASK;
@@ -185,14 +189,17 @@ public:
             float delayedR = bufR[rIdxR1] + fracR * (bufR[rIdxR2] - bufR[rIdxR1]);
 
             // Write to Delay Buffer with Feedback
-            bufL[writeIdx] = inL + (delayedL * fb);
-            bufR[writeIdx] = inR + (delayedR * fb);
-            writeIdx = (writeIdx + 1) & MASK;
+            bufL[wIdx] = inL + (delayedL * fb);
+            bufR[wIdx] = inR + (delayedR * fb);
+            wIdx = (wIdx + 1) & MASK;
 
             // Wet / Dry Mix (무손실 32-bit Float)
             ptr[0] = (inL * dGain) + (delayedL * wGain);
             ptr[1] = (inR * dGain) + (delayedR * wGain);
             ptr += 2;
         }
+
+        writeIdx = wIdx;
+        lfoPhase = phase;
     }
 };

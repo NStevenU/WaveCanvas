@@ -1,4 +1,5 @@
 #include "midi_sequencer.h"
+#include "config.h"
 #include "midi_parser.h"
 #include "audio_engine.h"
 #include "la32_synth.h"
@@ -26,6 +27,7 @@ bool MIDISequencer::isMemorySource = false;
 bool MIDISequencer::loopEnabled = false;
 
 uint16_t MIDISequencer::channelRPN[16] = {0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F};
+uint16_t MIDISequencer::channelNRPN[16] = {0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F, 0x7F7F};
 
 uint32_t MIDISequencer::readVarLen(const uint8_t** ptr, const uint8_t* end) {
     uint32_t value = 0;
@@ -50,15 +52,17 @@ static void sequencerTask(void* param) {
 
 bool MIDISequencer::begin() {
     state = SEQ_STOPPED;
+    TaskHandle_t hSeq = NULL;
     xTaskCreatePinnedToCore(
         sequencerTask,
         "MIDISeq",
         8192, // 8KB 스택으로 증설 (복잡한 16트랙 파싱 스택 안전 확보)
         NULL,
         3, // Core 0에서 UI 태스크보다 높은 우선순위
-        NULL,
+        &hSeq,
         0  // Core 0 전용
     );
+    DEBUG_REG_SEQ_TASK(hSeq);
     return true;
 }
 
@@ -346,14 +350,20 @@ void MIDISequencer::play() {
         }
 
         // STOP 상태에서 처음부터 재생하는 경우: 16채널 초기화 및 신스 모드 적용
-        MIDIParser::setSynthMode(songSynthMode); // 로드된 곡의 올바른 모드로 복원!
+        DEBUG_START_SESSION(songName);
+        SynthMode effectiveMode = songSynthMode;
+        if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_MANUAL) {
+            effectiveMode = (MIDIParser::getManualSubMode() == MANUAL_MODE_GS) ? SYNTH_MODE_GS :
+                            (MIDIParser::getManualSubMode() == MANUAL_MODE_MT32) ? SYNTH_MODE_MT32 : SYNTH_MODE_GM;
+        }
+        MIDIParser::setSynthMode(effectiveMode);
         
         SemaphoreHandle_t mutex = AudioEngine::getMutex();
         if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
         AudioEngine::systemResetDirect(); // 안전하게 16채널 리셋
-        if (songSynthMode == SYNTH_MODE_MT32) {
+        if (effectiveMode == SYNTH_MODE_MT32) {
             AudioEngine::applyMT32ModeDirect();
-        } else if (songSynthMode == SYNTH_MODE_GS) {
+        } else if (effectiveMode == SYNTH_MODE_GS) {
             AudioEngine::applyGSModeDirect();
         } else {
             AudioEngine::applyGMModeDirect();
@@ -376,6 +386,7 @@ void MIDISequencer::pause() {
 }
 
 void MIDISequencer::stopInternal() {
+    DEBUG_END_SESSION();
     state = SEQ_STOPPED;
     LEDIndicator::setState(LED_NORMAL);
     MIDIParser::setSynthMode(SYNTH_MODE_GM);
@@ -387,6 +398,7 @@ void MIDISequencer::stopInternal() {
     for (int i = 0; i < 16; i++) {
         MIDIParser::resetChannelStatus(i);
         channelRPN[i] = 0x7F7F; // RPN Null
+        channelNRPN[i] = 0x7F7F; // NRPN Null
     }
 
     // 트랙 포인터 리셋
@@ -407,6 +419,7 @@ void MIDISequencer::stop() {
 }
 
 SequencerState MIDISequencer::getState() { return state; }
+
 const char* MIDISequencer::getCurrentSongName() { return songName; }
 
 void MIDISequencer::processNextEvents() {
@@ -416,62 +429,56 @@ void MIDISequencer::processNextEvents() {
         if (tracks[t].isDone) continue;
         allDone = false;
 
-        while (!tracks[t].isDone && tracks[t].nextEventTick <= currentTick) {
-            if (tracks[t].current >= tracks[t].end) {
-                tracks[t].isDone = true;
-                break;
-            }
-
+        while (tracks[t].current < tracks[t].end && tracks[t].nextEventTick <= currentTick) {
             uint8_t status = *tracks[t].current;
 
-            if (status & 0x80) {
+            if (status < 0x80) {
+                status = tracks[t].runningStatus;
+            } else {
                 tracks[t].current++;
                 if (status < 0xF0) {
                     tracks[t].runningStatus = status;
                 }
-            } else {
-                status = tracks[t].runningStatus;
             }
 
             if (status == 0xFF) { // Meta Event
-                tracks[t].runningStatus = 0; // Cancel running status
+                if (tracks[t].current >= tracks[t].end) { tracks[t].isDone = true; break; }
                 uint8_t metaType = *tracks[t].current++;
                 uint32_t metaLen = readVarLen(&tracks[t].current, tracks[t].end);
                 if (tracks[t].current + metaLen > tracks[t].end) {
                     tracks[t].isDone = true;
                     break;
                 }
-                if (metaType == 0x51 && metaLen == 3) { // Set Tempo
-                    tempoUsPerQuarter = ((uint32_t)tracks[t].current[0] << 16) |
-                                        ((uint32_t)tracks[t].current[1] << 8) |
-                                        tracks[t].current[2];
-                    if (timeDivision > 0) {
-                        tickIntervalUs = tempoUsPerQuarter / timeDivision;
-                    }
-                } else if (metaType == 0x2F) { // End of Track
+
+                if (metaType == 0x2F) { // End of Track
                     tracks[t].isDone = true;
+                    break;
+                } else if (metaType == 0x51 && metaLen == 3) { // Set Tempo
+                    uint32_t us = ((uint32_t)tracks[t].current[0] << 16) |
+                                  ((uint32_t)tracks[t].current[1] << 8) |
+                                  ((uint32_t)tracks[t].current[2]);
+                    if (us > 0) {
+                        tempoUsPerQuarter = us;
+                        tickIntervalUs = tempoUsPerQuarter / timeDivision;
+                        if (tickIntervalUs < 100) tickIntervalUs = 100;
+                    }
                 }
                 tracks[t].current += metaLen;
-            } else if (status == 0xF0 || status == 0xF7) { // SysEx
-                tracks[t].runningStatus = 0; // Cancel running status
+            } else if (status == 0xF0 || status == 0xF7) { // SysEx Event
                 uint32_t sysexLen = readVarLen(&tracks[t].current, tracks[t].end);
                 if (tracks[t].current + sysexLen > tracks[t].end) {
                     tracks[t].isDone = true;
                     break;
                 }
+
                 const uint8_t* sdata = tracks[t].current;
-                if (sysexLen >= 5 && sdata[0] == 0x7E && sdata[2] == 0x09) {
-                    // GM1 / GM2 System On
-                    MIDIParser::setSynthMode(SYNTH_MODE_GM);
-                    AudioEngine::applyGMModeDirect();
-                    AudioEngine::systemResetDirect();
-                } else if (sysexLen >= 9 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
-                           sdata[4] == 0x20 && sdata[5] == 0x00 && sdata[6] == 0x00) {
-                    // Roland MT-32 LCD Text Display SysEx (F0 41 <dev> 16 12 20 00 00 <text...> <chk> F7)
-                    MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+                int rawLen = sysexLen;
+                if (rawLen > 0 && sdata[rawLen - 1] == 0xF7) rawLen--; // EOX 제외 유효 길이
+
+                if (rawLen >= 8 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
+                    sdata[4] == 0x20 && sdata[5] == 0x00 && sdata[6] == 0x00) {
+                    // Roland MT-32 LCD Text Display SysEx (OLED 토스트 팝업 연동)
                     char lcdMsg[24] = {0};
-                    int rawLen = sysexLen;
-                    if (rawLen > 0 && sdata[rawLen - 1] == 0xF7) rawLen--;
                     int textLen = rawLen - 8; // sdata: 41 dev 16 12 20 00 00 [text...] chk
                     if (textLen > 20) textLen = 20;
                     if (textLen > 0) {
@@ -487,15 +494,15 @@ void MIDISequencer::processNextEvents() {
                     // Roland MT-32 Reverb Parameter SysEx (F0 41 <dev> 16 12 10 00 01 <mode> <time> <level> <chk> F7)
                     MIDIParser::setSynthMode(SYNTH_MODE_MT32);
                     AudioEngine::setMT32ReverbDirect(sdata[7], sdata[8], (sysexLen >= 11 ? sdata[9] : 64));
-                } else if (sysexLen >= 14 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
-                           (sdata[4] == 0x04 || sdata[4] == 0x05 || sdata[4] == 0x08)) {
-                    // Roland MT-32 Timbre Temp / Patch Temp Memory Dump (커스텀 음색 파라미터 수신)
+                } else if (sysexLen >= 12 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
+                           (sdata[4] == 0x04 || sdata[4] == 0x08)) {
+                    // Roland MT-32 Timbre Temp / User Timbre Memory Dump (12 ~ 256바이트 파셜 음색 덤프)
                     MIDIParser::setSynthMode(SYNTH_MODE_MT32);
                     uint8_t targetPart = sdata[5] & 0x07; // Part 1~8 -> Channel 1~8 (Ch 2~9)
                     uint8_t targetCh = targetPart + 1;
                     LA32SynthEngine::setCustomTimbre(targetCh, &sdata[7], sysexLen - 8);
-                } else if (sysexLen >= 13 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
-                           sdata[4] == 0x05 && (sdata[6] == 0x00 || sdata[6] == 0x02)) {
+                } else if (sysexLen >= 12 && sysexLen < 60 && sdata[0] == 0x41 && sdata[2] == 0x16 && sdata[3] == 0x12 &&
+                           (sdata[4] == 0x03 || sdata[4] == 0x05) && (sdata[6] == 0x00 || sdata[6] == 0x02)) {
                     // Roland MT-32 Patch Temp (Key Shift, Fine Tune, Bender Range)
                     MIDIParser::setSynthMode(SYNTH_MODE_MT32);
                     uint8_t targetPart = sdata[5] & 0x07;
@@ -518,14 +525,18 @@ void MIDISequencer::processNextEvents() {
                     AudioEngine::setDrumKeyPanDirect(key, pan);
                 } else if (sysexLen >= 4 && sdata[0] == 0x41 && sdata[2] == 0x16) {
                     // Roland MT-32 SysEx (F0 41 <dev> 16 ...)
-                    MIDIParser::setSynthMode(SYNTH_MODE_MT32);
-                    AudioEngine::applyMT32ModeDirect();
+                    if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO) {
+                        MIDIParser::setSynthMode(SYNTH_MODE_MT32);
+                        AudioEngine::applyMT32ModeDirect();
+                    }
                 } else if (sysexLen >= 10 && sdata[0] == 0x41 && sdata[2] == 0x42 && sdata[3] == 0x12 &&
                            sdata[4] == 0x40 && sdata[5] == 0x00 && sdata[6] == 0x7F) {
                     // Roland GS Reset
-                    MIDIParser::setSynthMode(SYNTH_MODE_GS);
-                    AudioEngine::applyGSModeDirect();
-                    AudioEngine::systemResetDirect();
+                    if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO) {
+                        MIDIParser::setSynthMode(SYNTH_MODE_GS);
+                        AudioEngine::applyGSModeDirect();
+                        AudioEngine::systemResetDirect();
+                    }
                 } else if (sysexLen >= 11 && sdata[0] == 0x41 && sdata[2] == 0x42 && sdata[3] == 0x12 &&
                            sdata[4] == 0x40 && sdata[5] == 0x02 && sdata[6] == 0x00) {
                     // Roland GS Master EQ (F0 41 <dev> 42 12 40 02 00 <LFreq> <LGain> <HFreq> <HGain> <chk> F7)
@@ -632,10 +643,16 @@ void MIDISequencer::processNextEvents() {
                 }
                 tracks[t].current += sysexLen;
             } else if (status >= 0x80 && status < 0xF0) { // MIDI Voice Message
+                DEBUG_RECORD_SEQ_MIDI();
                 uint8_t type = status & 0xF0;
                 uint8_t ch = status & 0x0F;
+                if (tracks[t].current >= tracks[t].end) { tracks[t].isDone = true; break; }
                 uint8_t d1 = *tracks[t].current++;
-                uint8_t d2 = (type == 0xC0 || type == 0xD0) ? 0 : *tracks[t].current++;
+                uint8_t d2 = 0;
+                if (type != 0xC0 && type != 0xD0) {
+                    if (tracks[t].current >= tracks[t].end) { tracks[t].isDone = true; break; }
+                    d2 = *tracks[t].current++;
+                }
 
                 switch (type) {
                     case 0x90: // Note On
@@ -665,8 +682,12 @@ void MIDISequencer::processNextEvents() {
                     case 0xB0: // Control Change
                         if (d1 == 0) { // Bank Select MSB
                             if (ch != 9) {
-                                // [수정] Bank 127을 포함한 모든 뱅크 변경(d2 > 0)은 GS 모드로 처리 (SC-55 실기 표준)
-                                if (d2 > 0) MIDIParser::setSynthMode(SYNTH_MODE_GS);
+                                if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO) {
+                                    if (d2 > 0) MIDIParser::setSynthMode(SYNTH_MODE_GS);
+                                } else if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_MANUAL &&
+                                           MIDIParser::getManualSubMode() == MANUAL_MODE_GM) {
+                                    d2 = 0; // 수동 GM 모드일 때는 Bank 0 고정
+                                }
                             }
                         }
                         if (d1 == 7) {
@@ -675,23 +696,67 @@ void MIDISequencer::processNextEvents() {
                         if (d1 == 11) {
                             MIDIParser::setChannelExpression(ch, d2);
                         }
-                        if (d1 == 101) channelRPN[ch] = (channelRPN[ch] & 0x007F) | ((uint16_t)d2 << 7);
-                        if (d1 == 100) channelRPN[ch] = (channelRPN[ch] & 0x3F80) | (d2 & 0x7F);
-
-                        // NRPN 수신 시 RPN 상태 즉시 무효화 (Null RPN)
-                        if (d1 == 99 || d1 == 98) {
+                        // NRPN / RPN 등록 (8비트 MSB/LSB 결합)
+                        if (d1 == 99) { // NRPN MSB
+                            channelNRPN[ch] = (channelNRPN[ch] & 0x00FF) | ((uint16_t)d2 << 8);
                             channelRPN[ch] = 0x7F7F;
+                            if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO && MIDIParser::getSynthMode() == SYNTH_MODE_GM) {
+                                MIDIParser::setSynthMode(SYNTH_MODE_GS);
+                            }
+                        }
+                        if (d1 == 98) { // NRPN LSB
+                            channelNRPN[ch] = (channelNRPN[ch] & 0xFF00) | (d2 & 0x7F);
+                            channelRPN[ch] = 0x7F7F;
+                            if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO && MIDIParser::getSynthMode() == SYNTH_MODE_GM) {
+                                MIDIParser::setSynthMode(SYNTH_MODE_GS);
+                            }
+                        }
+                        if (d1 == 101) { // RPN MSB
+                            channelRPN[ch] = (channelRPN[ch] & 0x00FF) | ((uint16_t)d2 << 8);
+                            channelNRPN[ch] = 0x7F7F;
+                        }
+                        if (d1 == 100) { // RPN LSB
+                            channelRPN[ch] = (channelRPN[ch] & 0xFF00) | (d2 & 0x7F);
+                            channelNRPN[ch] = 0x7F7F;
                         }
 
                         if (d1 == 6) { // Data Entry MSB
                             if (channelRPN[ch] == 0x0000) { // Pitch Bend Sensitivity (RPN 00 00)
                                 uint8_t range = (d2 > 24) ? 24 : d2;
                                 AudioEngine::setPitchRangeDirect(ch, (float)range);
-                                channelRPN[ch] = 0x7F7F;
+                            } else if (channelNRPN[ch] == 0x0108) { // Vibrato Rate
+                                AudioEngine::controlChangeDirect(ch, 76, d2);
+                            } else if (channelNRPN[ch] == 0x0109) { // Vibrato Depth
+                                AudioEngine::controlChangeDirect(ch, 77, d2);
+                            } else if (channelNRPN[ch] == 0x010A) { // Vibrato Delay
+                                AudioEngine::controlChangeDirect(ch, 78, d2);
+                            } else if (channelNRPN[ch] == 0x0120) { // TVF Cutoff Frequency
+                                AudioEngine::controlChangeDirect(ch, 74, d2);
+                            } else if (channelNRPN[ch] == 0x0121) { // TVF Resonance
+                                AudioEngine::controlChangeDirect(ch, 71, d2);
+                            } else if (channelNRPN[ch] == 0x0163) { // Envelope Attack Time
+                                AudioEngine::controlChangeDirect(ch, 73, d2);
+                            } else if (channelNRPN[ch] == 0x0164) { // Envelope Decay Time
+                                AudioEngine::controlChangeDirect(ch, 75, d2);
+                            } else if (channelNRPN[ch] == 0x0166) { // Envelope Release Time
+                                AudioEngine::controlChangeDirect(ch, 72, d2);
+                            } else if ((channelNRPN[ch] >> 8) == 0x18) { // Drum Key Pitch Coarse
+                                uint8_t dKey = channelNRPN[ch] & 0x7F;
+                                AudioEngine::setDrumKeyPitchDirect(dKey, (int8_t)d2 - 64);
+                            } else if ((channelNRPN[ch] >> 8) == 0x1A) { // Drum Key TVF Cutoff
+                                uint8_t dKey = channelNRPN[ch] & 0x7F;
+                                AudioEngine::setDrumKeyCutoffDirect(dKey, (int8_t)d2 - 64);
+                            } else if ((channelNRPN[ch] >> 8) == 0x1C) { // Drum Key Level
+                                uint8_t dKey = channelNRPN[ch] & 0x7F;
+                                AudioEngine::setDrumKeyLevelDirect(dKey, d2);
+                            } else if ((channelNRPN[ch] >> 8) == 0x1D) { // Drum Key Panpot
+                                uint8_t dKey = channelNRPN[ch] & 0x7F;
+                                AudioEngine::setDrumKeyPanDirect(dKey, d2);
                             }
                         }
                         if (d1 == 121) {
                             channelRPN[ch] = 0x7F7F;
+                            channelNRPN[ch] = 0x7F7F;
                         }
                         if (d1 == 120 || d1 == 123) MIDIParser::setChannelVU(ch, 0);
                         if (d1 == 126) AudioEngine::setChannelMonoDirect(ch, true);

@@ -174,6 +174,7 @@ void LA32SynthEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity, flo
     v.structure34 = tp.structure34 ? tp.structure34 : 1;
     v.pitchSlide = 0.012f; // 어택 피치 슬라이드
     v.pitchSlideStep = v.pitchSlide / (float)(0.030f * LA32_SAMPLE_RATE);
+    v.pitchBendSemitones = 0.0f;
     v.velNorm = (MIDIParser::getSynthMode() == SYNTH_MODE_MT32) ? MT32_VELO_LUT[velocity & 0x7F] : ((float)velocity / 127.0f);
 
     for (int p = 0; p < 4; p++) {
@@ -269,7 +270,33 @@ void LA32SynthEngine::allNotesOff(uint8_t channel) {
     activeVoiceCount = count;
 }
 
+void LA32SynthEngine::pitchBend(uint8_t channel, float semitones) {
+    for (int i = 0; i < LA32_MAX_VOICES; i++) {
+        LA32Voice& v = voices[i];
+        if (v.active && v.channel == channel) {
+            v.pitchBendSemitones = semitones;
+            float bendMul = powf(2.0f, semitones / 12.0f);
+            const LA32TimbreParam& tp = channelTimbres[channel];
+            for (int p = 0; p < 4; p++) {
+                if (!v.partActive[p]) continue;
+                if (v.usePCM[p]) {
+                    uint8_t pcmID = tp.partials[p].wg_pcmNum & 0x7F;
+                    const MT32PCMEntry& entry = MT32_PCM_TABLE[pcmID];
+                    float pitchDiff = ((float)v.key * 256.0f - ((float)entry.pitch - 5120.0f)) / 3072.0f;
+                    v.pcmStep[p] = powf(2.0f, pitchDiff) * (32000.0f / 44100.0f) * bendMul;
+                } else {
+                    float freq = s_freq_table[v.key & 0x7F] * bendMul;
+                    if (p == 2) freq *= 1.0025f;
+                    v.phaseInc[p] = freq / LA32_SAMPLE_RATE;
+                    v.invPhaseInc[p] = (v.phaseInc[p] > 1e-6f) ? (1.0f / v.phaseInc[p]) : 0.0f;
+                }
+            }
+        }
+    }
+}
+
 void LA32SynthEngine::renderVoices(float* buffer, int numFrames) {
+    if (numFrames > 512) numFrames = 512;
     int activeCount = 0;
 
     // TSF 사운드폰트 엔진과 1:1 완벽하게 일치하는 마스터 볼륨 정규화 (0.80f Gervill 기준 + -6dB 헤드룸 보정)

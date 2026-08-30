@@ -33,6 +33,7 @@ public:
     static void setGSChorusParamsDirect(uint8_t level, uint8_t fb, uint8_t delay, uint8_t rate, uint8_t depth);
     static void setMT32ReverbDirect(uint8_t mode, uint8_t time, uint8_t level);
     static void setDrumKeyPitchDirect(uint8_t key, int8_t pitch);
+    static void setDrumKeyCutoffDirect(uint8_t key, int8_t cutoff);
     static void setDrumKeyLevelDirect(uint8_t key, uint8_t level);
     static void setDrumKeyPanDirect(uint8_t key, uint8_t pan);
     static void resetDrumKeyParamsDirect();

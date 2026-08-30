@@ -12,9 +12,19 @@ struct ChannelStatus {
 
 enum SynthMode {
     SYNTH_MODE_GM,
-    SYNTH_MODE_GM2,
     SYNTH_MODE_GS,
     SYNTH_MODE_MT32
+};
+
+enum SynthPolicy {
+    SYNTH_POLICY_AUTO = 0,    // 스마트 자동 감지 (기본값)
+    SYNTH_POLICY_MANUAL = 1   // 수동 고정 모드
+};
+
+enum ManualSubMode {
+    MANUAL_MODE_GM = 0,
+    MANUAL_MODE_GS = 1,
+    MANUAL_MODE_MT32 = 2
 };
 
 class MIDIParser {
@@ -45,6 +55,13 @@ public:
     static void setSynthMode(SynthMode mode);
     static const char* getSynthModeString();
 
+    static SynthPolicy getSynthPolicy();
+    static void setSynthPolicy(SynthPolicy policy, bool save = true);
+    static ManualSubMode getManualSubMode();
+    static void setManualSubMode(ManualSubMode mode, bool save = true);
+    static void cycleManualSubMode();
+    static const char* getIndicatorString();
+
 private:
     static uint32_t currentBaud;
     static ChannelStatus channels[16];
@@ -54,6 +71,7 @@ private:
     static uint8_t msgIndex;
     static uint8_t expectedLength;
     static uint16_t channelRPN[16];
+    static uint16_t channelNRPN[16];
 
     static void processCompleteMessage();
 };

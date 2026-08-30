@@ -21,6 +21,11 @@ void setup() {
     Serial.setTxTimeoutMs(0);
     delay(500);
 
+#if defined(ENABLE_DEBUG_METRICS)
+    DebugMonitor::init();
+    DEBUG_REG_LOOP_TASK(xTaskGetCurrentTaskHandle());
+#endif
+
     pinMode(PIN_MONO_DETECT, INPUT_PULLUP);
     bool isPlugged = (digitalRead(PIN_MONO_DETECT) == LOW);
     AudioEngine::setHardwareMonoDetected(isPlugged);

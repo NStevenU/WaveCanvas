@@ -6,6 +6,7 @@
 #include "speaker_eq.h"
 #include "master_eq.h"
 #include "midi_parser.h"
+#include "midi_sequencer.h"
 #include "mt32_prog_data.h"
 #include "la32_synth.h"
 #include <LittleFS.h>
@@ -48,6 +49,7 @@ static StereoReverb g_reverb;
 static MasterEQ g_master_eq;
 static SpeakerEQ g_speaker_eq;
 int8_t g_drum_pitch[128] = {0};
+int8_t g_drum_cutoff[128] = {0};
 static uint8_t g_drum_level[128] = {0};
 static uint8_t g_drum_pan[128] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -64,7 +66,7 @@ static uint8_t g_drum_pan[128] = {
 static const uint8_t MT32_DRUM_MAP[128] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 46, 45, 46, 47, // 44: MT-32 OpenHiHat2 -> SF2 Open Hi-Hat(46)
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 46, 45, 46, 47, // 44: MT-32 Half-Open -> SF2 Open Hi-Hat(46)
     48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
     80, 81, 39, 82, 30, 85, 33, 84, // 82:Slap->Clap(39), 83:ScratchPush->Shaker(82), 84:ScratchPull->30, 85:Snap->Castanets(85), 86:Click->Metronome(33), 87:BellTree->84
@@ -292,7 +294,9 @@ bool AudioEngine::loadSoundFont(const char* path) {
     float gain = normVol * normVol * 0.80f; // Gervill / midis2jam2 reference master gain 0.80
     // GM 및 MT-32 마스터 게인 기준 1:1 완전 일치 (0.80f)
     tsf_set_volume(new_tsf, gain);
-    tsf_set_max_voices(new_tsf, AUDIO_MAX_VOICES);
+    if (!tsf_set_max_voices(new_tsf, AUDIO_MAX_VOICES)) {
+        Serial.println("[AudioEngine] Warning: tsf_set_max_voices failed to allocate requested voices!");
+    }
 
     g_tsf = new_tsf;
 
@@ -344,12 +348,30 @@ void AudioEngine::audioTask(void* parameter) {
     size_t bytes_written = 0;
 
     while (true) {
+        int64_t t0 = esp_timer_get_time();
+        int64_t t_tsf_start = 0, t_tsf_end = 0;
+        int64_t t_la32_start = 0, t_la32_end = 0;
+        int64_t t_fx_start = 0, t_fx_end = 0;
+        int64_t t_mutex_acquired = 0;
+
+        int curTsfVoices = 0;
+        int curLa32Voices = 0;
+
         if (g_tsf && g_tsf_mutex) {
             if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                t_mutex_acquired = esp_timer_get_time();
+
+                t_tsf_start = t_mutex_acquired;
                 tsf_render_float(g_tsf, g_audio_float_buffer, AUDIO_BUFFER_SIZE, 0);
+                t_tsf_end = esp_timer_get_time();
+
+                t_la32_start = t_tsf_end;
                 LA32SynthEngine::render(g_audio_float_buffer, AUDIO_BUFFER_SIZE);
+                t_la32_end = esp_timer_get_time();
                 
-                int totalVoices = tsf_active_voice_count(g_tsf) + LA32SynthEngine::getActiveVoiceCount();
+                curTsfVoices = tsf_active_voice_count(g_tsf);
+                curLa32Voices = LA32SynthEngine::getActiveVoiceCount();
+                int totalVoices = curTsfVoices + curLa32Voices;
                 xSemaphoreGive(g_tsf_mutex);
 
                 if (totalVoices > 0) {
@@ -358,6 +380,7 @@ void AudioEngine::audioTask(void* parameter) {
                     s_silenceFrames++;
                 }
 
+                t_fx_start = esp_timer_get_time();
                 // 무음 지속 시 DSP 연산 전체 Auto-Bypass (대기 시 Core 1 CPU 0% 절감)
                 if (s_silenceFrames >= 85) { // 약 1.0초 리버브 테일 감쇠 후 완전 바이패스
                     memset(g_audio_buffer, 0, sizeof(g_audio_buffer));
@@ -376,21 +399,22 @@ void AudioEngine::audioTask(void* parameter) {
                         g_speaker_eq.processDownmixAndFilter(g_audio_float_buffer, AUDIO_BUFFER_SIZE);
                     }
 
-                    // Master Monotonic Rational Limiter & Single Int16 Conversion (최종 1회 단조 수렴 변환)
+                    // Master Ultra-Fast Soft-Clip Limiter & Single Int16 Conversion (안전 헤드룸 구간 무연산 패스스루, 피크 0% 클리핑)
                     int16_t* ptr = g_audio_buffer;
+                    const float* fptr = g_audio_float_buffer;
                     for (int i = 0; i < AUDIO_BUFFER_SIZE * 2; i++) {
-                        float s = g_audio_float_buffer[i];
-                        // 0.75f 이상 피크만 부드럽게 0.98f로 점근 수렴 (위상 역전/하드 클리핑 0%)
-                        if (s > 0.75f) {
-                            float diff = (s - 0.75f) * 4.0f;
-                            s = 0.75f + 0.23f * (diff / (1.0f + diff));
-                        } else if (s < -0.75f) {
-                            float diff = (-s - 0.75f) * 4.0f;
-                            s = -(0.75f + 0.23f * (diff / (1.0f + diff)));
+                        float s = fptr[i];
+                        if (s > 0.80f) {
+                            float diff = (s - 0.80f) * 4.0f;
+                            s = 0.80f + 0.18f * (diff / (1.0f + diff));
+                        } else if (s < -0.80f) {
+                            float diff = (-s - 0.80f) * 4.0f;
+                            s = -(0.80f + 0.18f * (diff / (1.0f + diff)));
                         }
                         ptr[i] = (int16_t)(s * 32767.0f);
                     }
                 }
+                t_fx_end = esp_timer_get_time();
 
             } else {
                 memset(g_audio_buffer, 0, sizeof(g_audio_buffer));
@@ -399,9 +423,24 @@ void AudioEngine::audioTask(void* parameter) {
             memset(g_audio_buffer, 0, sizeof(g_audio_buffer));
         }
 
-        i2s_write(I2S_NUM_0, g_audio_buffer, sizeof(g_audio_buffer), &bytes_written, portMAX_DELAY);
+        uint32_t mutexWaitUs = (t_mutex_acquired > t0) ? (uint32_t)(t_mutex_acquired - t0) : 0;
+        uint32_t tsfUs = (t_tsf_end >= t_tsf_start) ? (uint32_t)(t_tsf_end - t_tsf_start) : 0;
+        uint32_t la32Us = (t_la32_end >= t_la32_start) ? (uint32_t)(t_la32_end - t_la32_start) : 0;
+        uint32_t fxUs = (t_fx_end >= t_fx_start) ? (uint32_t)(t_fx_end - t_fx_start) : 0;
+
+        int64_t t_i2s_start = esp_timer_get_time();
+        esp_err_t i2sRes = i2s_write(I2S_NUM_0, g_audio_buffer, sizeof(g_audio_buffer), &bytes_written, portMAX_DELAY);
+        int64_t t_i2s_end = esp_timer_get_time();
+        uint32_t i2sWriteUs = (uint32_t)(t_i2s_end - t_i2s_start);
+
+        size_t dmaBufferedBytes = 0;
+
+        bool isSeqPlaying = (MIDISequencer::getState() == SEQ_PLAYING);
+        DEBUG_AUDIO_DETAILED(mutexWaitUs, tsfUs, la32Us, fxUs, i2sWriteUs, curTsfVoices, curLa32Voices, i2sRes, bytes_written, dmaBufferedBytes, isSeqPlaying);
     }
 }
+
+
 
 bool AudioEngine::begin() {
     // NVRAM(NVS)에서 저장된 마스터 볼륨 및 오디오 모드 복원
@@ -423,19 +462,21 @@ bool AudioEngine::begin() {
     }
 
     // Core 1에 고우선순위 오디오 렌더링 태스크 생성 (FreeRTOS Core 1 고정)
+    TaskHandle_t hAud = NULL;
     BaseType_t res = xTaskCreatePinnedToCore(
         audioTask,
         "AudioTask",
         8192,
         NULL,
         configMAX_PRIORITIES - 1, // 최고 수준 우선순위
-        NULL,
+        &hAud,
         1 // Core 1 (DSP Core)
     );
 
     if (res != pdPASS) {
         return false;
     }
+    DEBUG_REG_AUDIO_TASK(hAud);
 
     return true;
 }
@@ -443,7 +484,7 @@ bool AudioEngine::begin() {
 // MIDI 메시지 처리
 void AudioEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         noteOnDirect(channel, key, velocity);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -451,7 +492,7 @@ void AudioEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity) {
 
 void AudioEngine::noteOff(uint8_t channel, uint8_t key) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         noteOffDirect(channel, key);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -459,7 +500,7 @@ void AudioEngine::noteOff(uint8_t channel, uint8_t key) {
 
 void AudioEngine::programChange(uint8_t channel, uint8_t program) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         programChangeDirect(channel, program);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -467,7 +508,7 @@ void AudioEngine::programChange(uint8_t channel, uint8_t program) {
 
 void AudioEngine::controlChange(uint8_t channel, uint8_t controller, uint8_t value) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         tsf_channel_midi_control(g_tsf, channel, controller, value);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -475,7 +516,7 @@ void AudioEngine::controlChange(uint8_t channel, uint8_t controller, uint8_t val
 
 void AudioEngine::pitchBend(uint8_t channel, uint16_t value) {
     if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         tsf_channel_set_pitchwheel(g_tsf, channel, (int)value);
         xSemaphoreGive(g_tsf_mutex);
     }
@@ -486,7 +527,7 @@ SemaphoreHandle_t AudioEngine::getMutex() {
 }
 
 void AudioEngine::noteOnDirect(uint8_t channel, uint8_t key, uint8_t velocity) {
-    if (LA32SynthEngine::isChannelCustom(channel)) {
+    if (MIDIParser::getSynthMode() == SYNTH_MODE_MT32 && LA32SynthEngine::isChannelCustom(channel)) {
         float panNorm = g_tsf ? tsf_channel_get_pan(g_tsf, channel) : 0.5f;
         LA32SynthEngine::noteOn(channel, key, velocity, panNorm);
         return;
@@ -550,17 +591,12 @@ void AudioEngine::noteOnDirect(uint8_t channel, uint8_t key, uint8_t velocity) {
 }
 
 void AudioEngine::noteOffDirect(uint8_t channel, uint8_t key) {
-    if (LA32SynthEngine::isChannelCustom(channel)) {
+    if (MIDIParser::getSynthMode() == SYNTH_MODE_MT32 && LA32SynthEngine::isChannelCustom(channel)) {
         LA32SynthEngine::noteOff(channel, key);
         return;
     }
 
     if (!g_tsf) return;
-    bool isDrum = (channel == 9) || tsf_channel_get_drum_mode(g_tsf, channel);
-    if (isDrum) {
-        // MIDI 1.0 & Roland MT-32 실기 표준: 드럼 타악기는 Note-Off를 무시하고 자연 감쇠(One-Shot)로 끝까지 연주
-        return;
-    }
     tsf_channel_note_off(g_tsf, channel, key);
 }
 
@@ -589,6 +625,10 @@ void AudioEngine::setDrumKeyPitchDirect(uint8_t key, int8_t pitch) {
     if (key < 128) g_drum_pitch[key] = pitch;
 }
 
+void AudioEngine::setDrumKeyCutoffDirect(uint8_t key, int8_t cutoff) {
+    if (key < 128) g_drum_cutoff[key] = cutoff;
+}
+
 void AudioEngine::setDrumKeyLevelDirect(uint8_t key, uint8_t level) {
     if (key < 128) g_drum_level[key] = level;
 }
@@ -599,6 +639,7 @@ void AudioEngine::setDrumKeyPanDirect(uint8_t key, uint8_t pan) {
 
 void AudioEngine::resetDrumKeyParamsDirect() {
     memset(g_drum_pitch, 0, sizeof(g_drum_pitch));
+    memset(g_drum_cutoff, 0, sizeof(g_drum_cutoff));
     memset(g_drum_level, 0, sizeof(g_drum_level));
     memset(g_drum_pan, 0xFF, sizeof(g_drum_pan));
 }
@@ -616,6 +657,13 @@ void AudioEngine::controlChangeDirect(uint8_t channel, uint8_t controller, uint8
 }
 
 void AudioEngine::pitchBendDirect(uint8_t channel, uint16_t value) {
+    if (MIDIParser::getSynthMode() == SYNTH_MODE_MT32 && LA32SynthEngine::isChannelCustom(channel)) {
+        float pitchRange = 2.0f;
+        if (g_tsf) pitchRange = tsf_channel_get_pitchrange(g_tsf, channel);
+        float semitones = ((float)value - 8192.0f) / 8192.0f * pitchRange;
+        LA32SynthEngine::pitchBend(channel, semitones);
+        return;
+    }
     if (!g_tsf) return;
     tsf_channel_set_pitchwheel(g_tsf, channel, (int)value);
 }
@@ -658,10 +706,13 @@ void AudioEngine::applyMT32ModeDirect() {
 }
 
 void AudioEngine::applyGMModeDirect() {
+    LA32SynthEngine::reset();
     if (!g_tsf) return;
     setMasterVolumeDirect(g_master_volume); // GM 기본 볼륨 복귀
     resetMT32FilterDirect();
     for (int ch = 0; ch < 16; ch++) {
+        MIDIParser::resetChannelStatus(ch); // MIDIParser 단의 볼륨 100, 익스프레션 127, 프로그램 0 복구!
+        tsf_channel_midi_control(g_tsf, ch, 121, 0); // CC 121: 볼륨 100, 익스프레션 127, 팬 64, 필터/엔벨로프 오프셋 0으로 완전 리셋!
         tsf_channel_set_pitchrange(g_tsf, ch, 2.0f); // GM 표준 피치벤드 (온음)
         if (ch == 9) {
             tsf_channel_set_drum_mode(g_tsf, 9, 1);
@@ -669,26 +720,34 @@ void AudioEngine::applyGMModeDirect() {
         } else {
             tsf_channel_set_drum_mode(g_tsf, ch, 0);
             tsf_channel_set_bank(g_tsf, ch, 0); // GM Melodic Bank 0
+            tsf_channel_set_presetnumber(g_tsf, ch, 0, 0); // GM 기본 Acoustic Piano 0으로 클린 초기화!
         }
     }
     g_master_eq.reset();
     g_reverb.setMacro(2); // Room 3 (GM Default)
+    g_chorus.reset();
 }
 
 void AudioEngine::applyGSModeDirect() {
+    LA32SynthEngine::reset();
     if (!g_tsf) return;
     setMasterVolumeDirect(g_master_volume); // GS 기본 볼륨 복귀
     resetMT32FilterDirect();
     for (int ch = 0; ch < 16; ch++) {
+        MIDIParser::resetChannelStatus(ch); // MIDIParser 단의 볼륨/익스프레션 복구!
+        tsf_channel_midi_control(g_tsf, ch, 121, 0); // CC 121: 컨트롤러 완전 리셋
         tsf_channel_set_pitchrange(g_tsf, ch, 2.0f); // GS 표준 피치벤드 (온음)
         if (ch == 9) {
             tsf_channel_set_drum_mode(g_tsf, 9, 1);
+            tsf_channel_set_presetnumber(g_tsf, 9, 0, 1); // Standard GS Drum Kit
         } else {
             tsf_channel_set_drum_mode(g_tsf, ch, 0);
+            tsf_channel_set_presetnumber(g_tsf, ch, 0, 0); // GS 기본 Acoustic Piano 0으로 클린 초기화!
         }
     }
     g_master_eq.reset();
     g_reverb.setMacro(2); // Room 3 (GS Default)
+    g_chorus.reset();
 }
 
 void AudioEngine::setChannelDrumMode(uint8_t channel, bool isDrum) {
@@ -708,6 +767,9 @@ void AudioEngine::panicDirect() {
     }
     g_chorus.reset();
     g_reverb.reset();
+    MIDIParser::setSynthMode(SYNTH_MODE_GM);
+    applyGMModeDirect();
+    MIDIParser::clearAllVU();
 }
 
 void AudioEngine::panic() {
@@ -852,7 +914,11 @@ bool AudioEngine::isEffectiveMono() {
     return g_is_mono_mode || g_hw_mono_detected;
 }
 
+static volatile bool s_testSoundRunning = false;
+
 void AudioEngine::playTestSound(int type) {
+    if (s_testSoundRunning) return;
+    s_testSoundRunning = true;
     xTaskCreatePinnedToCore([](void* param) {
         int soundType = (int)(intptr_t)param;
         if (soundType == 1) { // Piano C-Major Chord
@@ -946,6 +1012,7 @@ void AudioEngine::playTestSound(int type) {
                 AudioEngine::controlChange(ch, 10, 64);
             }
         }
+        s_testSoundRunning = false;
         vTaskDelete(NULL);
     }, "TestSound", 4096, (void*)(intptr_t)type, 2, NULL, 0);
 }

@@ -52,6 +52,7 @@ private:
     static uint32_t tickIntervalUs;
 
     static uint16_t channelRPN[16];
+    static uint16_t channelNRPN[16];
 
     static bool parseTracks(const uint8_t* data, size_t size);
     static void processNextEvents();

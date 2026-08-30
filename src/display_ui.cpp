@@ -24,6 +24,8 @@ static bool oledAvailable = false;
 ScreenMode DisplayUI::currentMode = SCREEN_MAIN_MIDI;
 int DisplayUI::menuIndex = 0;
 int DisplayUI::midiMenuIndex = 0;
+int DisplayUI::synthModeMenuIndex = 0;
+int DisplayUI::manualModeMenuIndex = 0;
 int DisplayUI::sfMenuIndex = 0;
 int DisplayUI::baudMenuIndex = 0;
 int DisplayUI::audioTestMenuIndex = 0;
@@ -127,7 +129,7 @@ static TaskHandle_t s_displayTaskHandle = nullptr;
 static void displayTask(void* pvParameters) {
     while (true) {
         DisplayUI::update();
-        vTaskDelay(pdMS_TO_TICKS(10)); // 10ms 양보 (Core 0의 UART 및 시퀀서 태스크 양보)
+        vTaskDelay(pdMS_TO_TICKS(10)); // 10ms 양보 (Core 0의 UART 및 BGM 시퀀서 태스크 100% 보장)
     }
 }
 
@@ -282,6 +284,7 @@ void DisplayUI::begin() {
       &s_displayTaskHandle,
       0
   );
+  DEBUG_REG_DISPLAY_TASK(s_displayTaskHandle);
 }
 
 void DisplayUI::wakeup() {
@@ -314,7 +317,7 @@ void DisplayUI::drawMainMIDIScreen() {
 
   char hdrRight[32];
   snprintf(hdrRight, sizeof(hdrRight), "%s V:%d%%",
-           MIDIParser::getSynthModeString(), AudioEngine::getMasterVolume());
+           MIDIParser::getIndicatorString(), AudioEngine::getMasterVolume());
   int hdrWidth = u8g2.getStrWidth(hdrRight);
   u8g2.drawStr(128 - hdrWidth, 7, hdrRight);
 
@@ -437,37 +440,37 @@ void DisplayUI::drawMainMenu() {
   u8g2.drawHLine(0, 11, 128);
 
   const char *items_ko_full[] = {
-      "1. MIDI 보관함",        "2. 사운드폰트 선택",   "3. Wi-Fi 정보 & IP",
+      "1. MIDI 보관함",        "2. 신스 모드 설정",   "3. 사운드폰트 선택",
+      "4. Wi-Fi 정보 & IP",    "5. MIDI 전송 속도",   "6. 오디오 테스트",
+      "7. 소리 출력 설정",     "8. LED 상태표시등",   "9. 언어 설정 (Lang)",
+      "10. 긴급 리셋 (Panic)", "11. 기기 정보 (About)", "12. < 메인 화면으로 >"};
+
+  const char *items_en_full[] = {
+      "1. MIDI Library",       "2. Synth Mode",       "3. SoundFont Select",
+      "4. Wi-Fi Info & IP",    "5. MIDI Baud Rate",   "6. Audio Test",
+      "7. Audio Output",       "8. LED Status",       "9. Language",
+      "10. MIDI Panic",        "11. About",           "12. < Back to Main >"};
+
+  const char *items_ko_hide[] = {
+      "1. MIDI 보관함",        "2. 신스 모드 설정",   "3. Wi-Fi 정보 & IP",
       "4. MIDI 전송 속도",     "5. 오디오 테스트",     "6. 소리 출력 설정",
       "7. LED 상태표시등",     "8. 언어 설정 (Lang)",  "9. 긴급 리셋 (Panic)",
       "10. 기기 정보 (About)", "11. < 메인 화면으로 >"};
 
-  const char *items_en_full[] = {
-      "1. MIDI Library",   "2. SoundFont Select", "3. Wi-Fi Info & IP",
-      "4. MIDI Baud Rate", "5. Audio Test",       "6. Audio Output",
-      "7. LED Status",     "8. Language",         "9. MIDI Panic",
-      "10. About",         "11. < Back to Main >"};
-
-  const char *items_ko_hide[] = {
-      "1. MIDI 보관함",       "2. Wi-Fi 정보 & IP",   "3. MIDI 전송 속도",
-      "4. 오디오 테스트",     "5. 소리 출력 설정",    "6. LED 상태표시등",
-      "7. 언어 설정 (Lang)",  "8. 긴급 리셋 (Panic)", "9. 기기 정보 (About)",
-      "10. < 메인 화면으로 >"};
-
-  const char *items_en_hide[] = {"1. MIDI Library",   "2. Wi-Fi Info & IP",
-                                 "3. MIDI Baud Rate", "4. Audio Test",
-                                 "5. Audio Output",   "6. LED Status",
-                                 "7. Language",       "8. MIDI Panic",
-                                 "9. About",          "10. < Back to Main >"};
+  const char *items_en_hide[] = {
+      "1. MIDI Library",       "2. Synth Mode",       "3. Wi-Fi Info & IP",
+      "4. MIDI Baud Rate",     "5. Audio Test",       "6. Audio Output",
+      "7. LED Status",         "8. Language",         "9. MIDI Panic",
+      "10. About",             "11. < Back to Main >"};
 
   const char **items;
   int total;
   if (fontManagementEnabled) {
     items = isKorean ? items_ko_full : items_en_full;
-    total = 11;
+    total = 12;
   } else {
     items = isKorean ? items_ko_hide : items_en_hide;
-    total = 10;
+    total = 11;
   }
 
   int visible = 4;
@@ -518,6 +521,76 @@ void DisplayUI::drawMIDILibraryMenu() {
     drawMenuItemWithMarquee(2, y, 118, displayText, (i == midiMenuIndex));
   }
   drawScrollbar(125, 16, 2, 47, total, midiMenuIndex, visible);
+}
+
+void DisplayUI::drawSynthModeMenu() {
+  u8g2.setFont(u8g2_font_galmuri9);
+  u8g2.drawUTF8(0, 9, isKorean ? "[ 신스 모드 설정 ]" : "[ SYNTH MODE ]");
+  u8g2.drawHLine(0, 11, 128);
+
+  bool isAuto = (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO);
+  const char *sItems_ko[] = {"스마트 모드 (Auto)", "수동 모드 (Manual)",
+                             "< 메뉴로 돌아가기 >"};
+  const char *sItems_en[] = {"Smart Mode (Auto)", "Manual Mode",
+                             "< Back to Menu >"};
+  const char **sItems = isKorean ? sItems_ko : sItems_en;
+
+  for (int i = 0; i < 3; i++) {
+    int y = 26 + (i * 11);
+    bool isCurrent = (i == 0 && isAuto) || (i == 1 && !isAuto);
+    char itemText[32];
+    if (i == 2) {
+      snprintf(itemText, sizeof(itemText), "%s", sItems[i]);
+    } else {
+      snprintf(itemText, sizeof(itemText), "%s%s", isCurrent ? "* " : "  ",
+               sItems[i]);
+    }
+
+    if (i == synthModeMenuIndex) {
+      u8g2.drawBox(0, y - 9, 128, 10);
+      u8g2.setDrawColor(0);
+      u8g2.drawUTF8(2, y, itemText);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawUTF8(2, y, itemText);
+    }
+  }
+}
+
+void DisplayUI::drawManualModeMenu() {
+  u8g2.setFont(u8g2_font_galmuri9);
+  u8g2.drawUTF8(0, 9, isKorean ? "[ 수동 모드 선택 ]" : "[ MANUAL MODE ]");
+  u8g2.drawHLine(0, 11, 128);
+
+  ManualSubMode curSub = MIDIParser::getManualSubMode();
+  const char *mItems_ko[] = {"GM 모드", "GS 모드", "MT-32 모드",
+                             "< 뒤로 가기 >"};
+  const char *mItems_en[] = {"GM Mode", "GS Mode", "MT-32 Mode",
+                             "< Back >"};
+  const char **mItems = isKorean ? mItems_ko : mItems_en;
+
+  for (int i = 0; i < 4; i++) {
+    int y = 26 + (i * 11);
+    bool isCurrent = (i == 0 && curSub == MANUAL_MODE_GM) ||
+                     (i == 1 && curSub == MANUAL_MODE_GS) ||
+                     (i == 2 && curSub == MANUAL_MODE_MT32);
+    char itemText[32];
+    if (i == 3) {
+      snprintf(itemText, sizeof(itemText), "%s", mItems[i]);
+    } else {
+      snprintf(itemText, sizeof(itemText), "%s%s", isCurrent ? "* " : "  ",
+               mItems[i]);
+    }
+
+    if (i == manualModeMenuIndex) {
+      u8g2.drawBox(0, y - 9, 128, 10);
+      u8g2.setDrawColor(0);
+      u8g2.drawUTF8(2, y, itemText);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawUTF8(2, y, itemText);
+    }
+  }
 }
 
 void DisplayUI::drawSoundFontMenu() {
@@ -885,10 +958,20 @@ void DisplayUI::handleEncoderEvent(EncoderEvent event) {
   if (event == ENC_BUTTON_VERY_LONG) {
     if (currentMode == SCREEN_GAME_RUNNING) {
       GameEngine::exitGame();
-      showToast(isKorean ? "게임 종료" : "Game Exited", 1200);
       currentMode = SCREEN_MENU_GAMES;
+      showToast(isKorean ? "게임 종료" : "Game Exit", 1500);
       return;
     }
+  }
+
+  if (event == ENC_BUTTON_PANIC) {
+    if (currentMode == SCREEN_GAME_RUNNING) {
+      GameEngine::handleEncoderEvent(event);
+      return;
+    }
+    AudioEngine::panic();
+    showToast(isKorean ? "초기화 완료!" : "MIDI PANIC!");
+    return;
   }
 
   // 2. 1.0초 롱프레스 처리
@@ -913,9 +996,26 @@ void DisplayUI::handleEncoderEvent(EncoderEvent event) {
       GameEngine::handleEncoderEvent(event);
       return;
     }
-    // 일반 화면에서는 MIDI Panic 실행
-    AudioEngine::panic();
-    showToast(isKorean ? "초기화 완료!" : "MIDI PANIC!");
+    if (currentMode == SCREEN_MAIN_MIDI) {
+      // 수동 모드일 때만 3개 모드 순환 변경
+      if (MIDIParser::getSynthPolicy() == SYNTH_POLICY_MANUAL) {
+        bool isPlaying = (MIDISequencer::getState() == SEQ_PLAYING) || MIDIParser::isMIDIActive();
+        if (isPlaying) {
+          showToast(isKorean ? "재생중 모드 변경 불가" : "Playing: Locked", 1500);
+          return;
+        }
+        MIDIParser::cycleManualSubMode();
+        const char *name =
+            (MIDIParser::getManualSubMode() == MANUAL_MODE_GS)     ? "GS"
+            : (MIDIParser::getManualSubMode() == MANUAL_MODE_MT32) ? "MT-32"
+                                                                   : "GM";
+        char buf[32];
+        snprintf(buf, sizeof(buf), isKorean ? "수동: %s 모드" : "Manual: %s",
+                 name);
+        showToast(buf, 1200);
+      }
+      return;
+    }
     return;
   }
 
@@ -949,15 +1049,15 @@ void DisplayUI::handleEncoderEvent(EncoderEvent event) {
   }
 
   case SCREEN_MENU_MAIN: {
-    int total = fontManagementEnabled ? 11 : 10;
+    int total = fontManagementEnabled ? 12 : 11;
     if (event == ENC_ROTATE_CW) {
       menuIndex = (menuIndex + 1) % total;
     } else if (event == ENC_ROTATE_CCW) {
       menuIndex = (menuIndex + total - 1) % total;
     } else if (event == ENC_BUTTON_CLICK) {
       int actionId = menuIndex;
-      if (!fontManagementEnabled && actionId >= 1) {
-        actionId += 1; // 사운드폰트 메뉴(1) 스킵 매핑
+      if (!fontManagementEnabled && actionId >= 2) {
+        actionId += 1; // 사운드폰트 메뉴(2) 스킵 매핑
       }
 
       if (actionId == 0) {
@@ -965,35 +1065,98 @@ void DisplayUI::handleEncoderEvent(EncoderEvent event) {
         midiMenuIndex = 0;
         currentMode = SCREEN_MENU_MIDI_LIBRARY;
       } else if (actionId == 1) {
+        synthModeMenuIndex = (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO) ? 0 : 1;
+        currentMode = SCREEN_MENU_SYNTH_MODE;
+      } else if (actionId == 2) {
         updateFontFileList();
         sfMenuIndex = 0;
         currentMode = SCREEN_MENU_SOUNDFONT;
-      } else if (actionId == 2) {
-        currentMode = SCREEN_MENU_WIFI_INFO;
       } else if (actionId == 3) {
+        currentMode = SCREEN_MENU_WIFI_INFO;
+      } else if (actionId == 4) {
         baudMenuIndex = 0;
         currentMode = SCREEN_MENU_BAUDRATE;
-      } else if (actionId == 4) {
+      } else if (actionId == 5) {
         audioTestMenuIndex = 0;
         currentMode = SCREEN_MENU_AUDIO_TEST;
-      } else if (actionId == 5) {
+      } else if (actionId == 6) {
         audioOutputMenuIndex = AudioEngine::isMonoMode() ? 1 : 0;
         currentMode = SCREEN_MENU_AUDIO_OUTPUT;
-      } else if (actionId == 6) {
+      } else if (actionId == 7) {
         ledStatusMenuIndex = LEDIndicator::isEnabled() ? 0 : 1;
         currentMode = SCREEN_MENU_LED_STATUS;
-      } else if (actionId == 7) {
+      } else if (actionId == 8) {
         languageMenuIndex = isKorean ? 0 : 1;
         currentMode = SCREEN_MENU_LANGUAGE;
-      } else if (actionId == 8) {
+      } else if (actionId == 9) {
         AudioEngine::panic();
         showToast(isKorean ? "초기화 완료!" : "MIDI PANIC!");
         currentMode = SCREEN_MAIN_MIDI;
-      } else if (actionId == 9) {
+      } else if (actionId == 10) {
         aboutScrollOffset = 0;
         currentMode = SCREEN_MENU_ABOUT;
-      } else if (actionId == 10) {
+      } else if (actionId == 11) {
         currentMode = SCREEN_MAIN_MIDI;
+      }
+    }
+    break;
+  }
+
+  case SCREEN_MENU_SYNTH_MODE: {
+    if (event == ENC_ROTATE_CW) {
+      synthModeMenuIndex = (synthModeMenuIndex + 1) % 3;
+    } else if (event == ENC_ROTATE_CCW) {
+      synthModeMenuIndex = (synthModeMenuIndex + 2) % 3;
+    } else if (event == ENC_BUTTON_CLICK) {
+      if (synthModeMenuIndex == 0) {
+        bool isPlaying = (MIDISequencer::getState() == SEQ_PLAYING) || MIDIParser::isMIDIActive();
+        if (isPlaying) {
+          showToast(isKorean ? "재생중 모드 변경 불가" : "Playing: Locked", 1500);
+          return;
+        }
+        MIDIParser::setSynthPolicy(SYNTH_POLICY_AUTO, true);
+        showToast(isKorean ? "스마트 모드 적용" : "Smart Mode Set", 1200);
+        currentMode = SCREEN_MAIN_MIDI;
+      } else if (synthModeMenuIndex == 1) {
+        manualModeMenuIndex = (int)MIDIParser::getManualSubMode();
+        currentMode = SCREEN_MENU_MANUAL_MODE;
+      } else {
+        currentMode = SCREEN_MENU_MAIN;
+      }
+    }
+    break;
+  }
+
+  case SCREEN_MENU_MANUAL_MODE: {
+    if (event == ENC_ROTATE_CW) {
+      manualModeMenuIndex = (manualModeMenuIndex + 1) % 4;
+    } else if (event == ENC_ROTATE_CCW) {
+      manualModeMenuIndex = (manualModeMenuIndex + 3) % 4;
+    } else if (event == ENC_BUTTON_CLICK) {
+      if (manualModeMenuIndex <= 2) {
+        bool isPlaying = (MIDISequencer::getState() == SEQ_PLAYING) || MIDIParser::isMIDIActive();
+        if (isPlaying) {
+          showToast(isKorean ? "재생중 모드 변경 불가" : "Playing: Locked", 1500);
+          return;
+        }
+      }
+      if (manualModeMenuIndex == 0) {
+        MIDIParser::setSynthPolicy(SYNTH_POLICY_MANUAL, true);
+        MIDIParser::setManualSubMode(MANUAL_MODE_GM, true);
+        showToast(isKorean ? "수동: GM 모드" : "Manual: GM", 1200);
+        currentMode = SCREEN_MAIN_MIDI;
+      } else if (manualModeMenuIndex == 1) {
+        MIDIParser::setSynthPolicy(SYNTH_POLICY_MANUAL, true);
+        MIDIParser::setManualSubMode(MANUAL_MODE_GS, true);
+        showToast(isKorean ? "수동: GS 모드" : "Manual: GS", 1200);
+        currentMode = SCREEN_MAIN_MIDI;
+      } else if (manualModeMenuIndex == 2) {
+        MIDIParser::setSynthPolicy(SYNTH_POLICY_MANUAL, true);
+        MIDIParser::setManualSubMode(MANUAL_MODE_MT32, true);
+        showToast(isKorean ? "수동: MT-32 모드" : "Manual: MT-32", 1200);
+        currentMode = SCREEN_MAIN_MIDI;
+      } else {
+        currentMode = SCREEN_MENU_SYNTH_MODE;
       }
     }
     break;
@@ -1293,6 +1456,12 @@ void DisplayUI::update() {
     break;
   case SCREEN_MENU_MIDI_LIBRARY:
     drawMIDILibraryMenu();
+    break;
+  case SCREEN_MENU_SYNTH_MODE:
+    drawSynthModeMenu();
+    break;
+  case SCREEN_MENU_MANUAL_MODE:
+    drawManualModeMenu();
     break;
   case SCREEN_MENU_SOUNDFONT:
     drawSoundFontMenu();

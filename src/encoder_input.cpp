@@ -58,35 +58,29 @@ EncoderEvent EncoderInput::getEvent() {
 }
 
 void EncoderInput::update() {
-    // 1. 회전 이벤트 처리 (인터럽트와의 레이스 컨디션 방지를 위한 원자적 처리)
-    int delta = 0;
-    noInterrupts();
-    if (encoderDelta > 0) {
-        delta = 1;
-        encoderDelta--;
-    } else if (encoderDelta < 0) {
-        delta = -1;
-        encoderDelta++;
+    // 1. 회전 이벤트 처리 (큐가 비어있을 때 누적 틱을 1개씩 순차 소비하여 틱 스킵 방지)
+    if (queuedEvent == ENC_NONE) {
+        noInterrupts();
+        if (encoderDelta > 0) {
+            encoderDelta--;
+            queuedEvent = ENC_ROTATE_CW;
+        } else if (encoderDelta < 0) {
+            encoderDelta++;
+            queuedEvent = ENC_ROTATE_CCW;
+        }
+        interrupts();
+        if (queuedEvent != ENC_NONE) return;
     }
-    interrupts();
-
-    if (delta > 0) {
-        queuedEvent = ENC_ROTATE_CW;
-        return;
-    } else if (delta < 0) {
-        queuedEvent = ENC_ROTATE_CCW;
-        return;
-    }
-
-    // 2. 버튼 입력 디바운싱 및 롱프레스 감지
     bool currentBtn = digitalRead(PIN_ENC_SW);
     static bool veryLongHandled = false;
+    static bool panicHandled = false;
 
     if (buttonState == HIGH && currentBtn == LOW) {
         // 누르기 시작 (Active Low)
         buttonState = LOW;
         buttonPressTime = millis();
         longPressHandled = false;
+        panicHandled = false;
         veryLongHandled = false;
     } else if (buttonState == LOW && currentBtn == LOW) {
         unsigned long dur = millis() - buttonPressTime;
@@ -95,7 +89,12 @@ void EncoderInput::update() {
             queuedEvent = ENC_BUTTON_VERY_LONG;
             veryLongHandled = true;
         }
-        // 1.0초 이상 = 일반 롱프레스 (하드드롭 / MIDI Panic / Easter Egg 진입용)
+        // 3.0초 이상 = 장기 롱프레스 (MIDI Panic 긴급 리셋)
+        else if (!panicHandled && dur >= 3000) {
+            queuedEvent = ENC_BUTTON_PANIC;
+            panicHandled = true;
+        }
+        // 1.0초 이상 = 중기 롱프레스 (수동 모드 순환 / 하드드롭 / Easter Egg)
         else if (!longPressHandled && dur >= 1000) {
             queuedEvent = ENC_BUTTON_LONG;
             longPressHandled = true;
@@ -103,7 +102,7 @@ void EncoderInput::update() {
     } else if (buttonState == LOW && currentBtn == HIGH) {
         // 손을 뗌
         buttonState = HIGH;
-        if (!longPressHandled && !veryLongHandled && (millis() - buttonPressTime >= 50)) { // 50ms 이상 디바운스
+        if (!longPressHandled && !panicHandled && !veryLongHandled && (millis() - buttonPressTime >= 50)) { // 50ms 이상 디바운스
             queuedEvent = ENC_BUTTON_CLICK;
         }
     }

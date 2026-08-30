@@ -358,8 +358,9 @@ static String generateHTML(const String& tab, const String& lang, const String& 
 
     html += "function onKeyDn(e) {\n";
     html += "  e = e || window.event;\n";
+    html += "  if (e.ctrlKey || e.metaKey || e.altKey) return;\n";
     html += "  var tgt = e.target || e.srcElement;\n";
-    html += "  if (tgt && (tgt.tagName == 'INPUT' || tgt.tagName == 'SELECT')) return;\n";
+    html += "  if (tgt && (tgt.tagName == 'INPUT' || tgt.tagName == 'SELECT' || tgt.tagName == 'TEXTAREA')) return;\n";
     html += "  var k = (e.key ? e.key : String.fromCharCode(e.keyCode)).toLowerCase();\n";
     html += "  if (typeof keyMap[k] != 'undefined' && !e.repeat) {\n";
     html += "    pianoNoteOn(keyMap[k]);\n";
@@ -368,21 +369,29 @@ static String generateHTML(const String& tab, const String& lang, const String& 
 
     html += "function onKeyUp(e) {\n";
     html += "  e = e || window.event;\n";
+    html += "  if (e.ctrlKey || e.metaKey || e.altKey) return;\n";
     html += "  var tgt = e.target || e.srcElement;\n";
-    html += "  if (tgt && (tgt.tagName == 'INPUT' || tgt.tagName == 'SELECT')) return;\n";
+    html += "  if (tgt && (tgt.tagName == 'INPUT' || tgt.tagName == 'SELECT' || tgt.tagName == 'TEXTAREA')) return;\n";
     html += "  var k = (e.key ? e.key : String.fromCharCode(e.keyCode)).toLowerCase();\n";
     html += "  if (typeof keyMap[k] != 'undefined') {\n";
     html += "    pianoNoteOff(keyMap[k]);\n";
     html += "  }\n";
     html += "}\n";
-
-    // 이벤트 등록 (W3C -> DOM Level 0 폴백)
-    html += "if (window.addEventListener) {\n";
-    html += "  window.addEventListener('keydown', onKeyDn, false);\n";
-    html += "  window.addEventListener('keyup', onKeyUp, false);\n";
-    html += "} else {\n";
-    html += "  document.onkeydown = onKeyDn;\n";
-    html += "  document.onkeyup = onKeyUp;\n";
+    html += "function releaseAllNotes() {\n";
+    html += "  for (var n in activeNotes) {\n";
+    html += "    pianoNoteOff(parseInt(n) - curOctShift);\n";
+    html += "  }\n";
+    html += "}\n";
+    html += "if ('" + activeTab + "' == 'piano') {\n";
+    html += "  if (window.addEventListener) {\n";
+    html += "    window.addEventListener('keydown', onKeyDn, false);\n";
+    html += "    window.addEventListener('keyup', onKeyUp, false);\n";
+    html += "    window.addEventListener('blur', releaseAllNotes, false);\n";
+    html += "  } else {\n";
+    html += "    document.onkeydown = onKeyDn;\n";
+    html += "    document.onkeyup = onKeyUp;\n";
+    html += "    window.onblur = releaseAllNotes;\n";
+    html += "  }\n";
     html += "}\n";
 
     html += "function initPianoTab() {\n";
@@ -416,6 +425,9 @@ static String generateHTML(const String& tab, const String& lang, const String& 
     }
     html += "<nobr><a href=\"/?tab=wifi&lang=" + lang + "\" class=\"" + (activeTab == "wifi" ? "tab-active" : "tab-inactive") + "\"><img src=\"/icon/wifi.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "와이파이 설정" : "Wi-Fi Setup") + "</a></nobr> ";
     html += "<nobr><a href=\"/?tab=settings&lang=" + lang + "\" class=\"" + (activeTab == "settings" ? "tab-active" : "tab-inactive") + "\"><img src=\"/icon/setup.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "시스템 설정" : "Settings") + "</a></nobr> ";
+#if defined(ENABLE_DEBUG_METRICS)
+    html += "<nobr><a href=\"/?tab=debug&lang=" + lang + "\" class=\"" + (activeTab == "debug" ? "tab-active" : "tab-inactive") + "\"><img src=\"/icon/setup.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "성능 진단" : "Diagnostics") + "</a></nobr> ";
+#endif
     html += "<nobr><a href=\"/?tab=piano&lang=" + lang + "\" id=\"tabPiano\" class=\"" + (activeTab == "piano" ? "tab-active" : "tab-inactive") + "\" style=\"" + (activeTab == "piano" ? "" : "display:none;") + "\"><img src=\"/icon/piano.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "가상 피아노" : "Virtual Piano") + "</a></nobr>\n";
     html += "</td>\n";
     html += "<td nowrap align=\"right\" valign=\"top\">\n";
@@ -835,6 +847,40 @@ static String generateHTML(const String& tab, const String& lang, const String& 
         html += "</div>\n";
         html += "</td></tr></table>\n";
 
+        // ---------------- [신디사이저 동작 모드 정책 설정] ----------------
+        html += "<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"section-table\">\n";
+        html += "<tr><td class=\"section-hdr\"><img src=\"/icon/piano.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "신디사이저 동작 모드 (Synth Mode Policy)" : "Synth Mode Policy") + "</td></tr>\n";
+        html += "<tr><td style=\"padding: 10px;\">\n";
+        html += "<form action=\"/action\" method=\"GET\">\n";
+        html += "<input type=\"hidden\" name=\"tab\" value=\"settings\">\n";
+        html += "<input type=\"hidden\" name=\"cmd\" value=\"set_synth_policy\">\n";
+        html += "<input type=\"hidden\" name=\"lang\" value=\"" + lang + "\">\n";
+        html += "<table width=\"100%\" cellpadding=\"4\" cellspacing=\"0\">\n";
+        
+        bool isAutoPolicy = (MIDIParser::getSynthPolicy() == SYNTH_POLICY_AUTO);
+        ManualSubMode curSub = MIDIParser::getManualSubMode();
+
+        html += "<tr><td width=\"130\" valign=\"top\"><b>" + String(isKo ? "동작 모드 선택:" : "Mode Policy:") + "</b></td>";
+        html += "<td>";
+        html += "<label><input type=\"radio\" name=\"policy\" value=\"0\"" + String(isAutoPolicy ? " checked" : "") + " onchange=\"document.getElementById('manual_box').style.display = this.checked ? 'none' : 'block'\"> <b>" + String(isKo ? "스마트 모드 (권장 - SysEx/뱅크 자동 감지 및 스마트 전환)" : "Smart Mode (Recommended - Auto Detection)") + "</b></label><br>\n";
+        html += "<label><input type=\"radio\" name=\"policy\" value=\"1\"" + String(!isAutoPolicy ? " checked" : "") + " onchange=\"document.getElementById('manual_box').style.display = this.checked ? 'block' : 'none'\"> <b>" + String(isKo ? "수동 모드 (특정 음원 엔진으로 강제 고정)" : "Manual Mode (Lock to specific synth mode)") + "</b></label>\n";
+        
+        html += "<div id=\"manual_box\" style=\"margin-top:8px; margin-left:20px; padding:6px 10px; background:#f0f0f0; border:1px inset #d0d0d0; display:" + String(isAutoPolicy ? "none" : "block") + ";\">\n";
+        html += "<b>" + String(isKo ? "└ 수동 고정 모드:" : "└ Manual Fixed Mode:") + "</b><br>\n";
+        html += "<label><input type=\"radio\" name=\"manual_sub\" value=\"0\"" + String(curSub == MANUAL_MODE_GM ? " checked" : "") + "> General MIDI (GM 표준)</label>&nbsp;&nbsp;\n";
+        html += "<label><input type=\"radio\" name=\"manual_sub\" value=\"1\"" + String(curSub == MANUAL_MODE_GS ? " checked" : "") + "> Roland GS (Sound Canvas)</label>&nbsp;&nbsp;\n";
+        html += "<label><input type=\"radio\" name=\"manual_sub\" value=\"2\"" + String(curSub == MANUAL_MODE_MT32 ? " checked" : "") + "> Roland MT-32 (LA-32)</label>\n";
+        html += "</div>\n";
+
+        html += "</td></tr>\n";
+        html += "<tr><td></td><td><button type=\"submit\" class=\"btn98\" style=\"font-weight:bold;\">" + String(isKo ? "모드 설정 저장" : "Save Mode Config") + "</button></td></tr>\n";
+        html += "</table>\n</form>\n";
+        html += "<div style=\"font-size:11px; color:#555555; line-height:1.4; margin-top:6px;\">\n";
+        html += "• " + String(isKo ? "<b>스마트 모드</b>: 미디 파일의 지문(SysEx/Bank/채널)을 분석하여 GM / GS / MT-32로 자동 전환합니다." : "<b>Smart Mode</b>: Automatically transitions between GM / GS / MT-32 based on MIDI stream fingerprints.") + "<br>\n";
+        html += "• " + String(isKo ? "<b>수동 모드</b>: 미디 파일의 변환 요청을 무시하고 선택한 모드로 100% 고정합니다. (기기 인코더 1초 롱프레스로도 순환 변경 가능)" : "<b>Manual Mode</b>: Locks synth engine to the selected mode. Can also cycle with 1-sec encoder press.") + "\n";
+        html += "</div>\n";
+        html += "</td></tr></table>\n";
+
         html += "<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"section-table\">\n";
         html += "<tr><td class=\"section-hdr\"><img src=\"/icon/warning.gif\" width=\"16\" height=\"16\" class=\"ic\" border=\"0\" alt=\"\">" + String(isKo ? "하드웨어 제어 및 진단" : "Diagnostics") + "</td></tr>\n";
         html += "<tr><td style=\"padding: 10px;\">\n";
@@ -923,6 +969,13 @@ static String generateHTML(const String& tab, const String& lang, const String& 
         html += "</div>\n</div>\n";
         html += "</td></tr></table>\n";
     }
+
+#if defined(ENABLE_DEBUG_METRICS)
+    // ---------------- [탭 6: 성능 진단 (Diagnostics)] ----------------
+    else if (activeTab == "debug") {
+        html += DebugMonitor::generateDebugTabHTML(isKo, lang);
+    }
+#endif
 
     html += "</td></tr></table>\n";
 
@@ -1060,6 +1113,36 @@ void WebManager::begin() {
         request->send(200, "image/gif", GIF_1X1, sizeof(GIF_1X1));
     });
 
+#if defined(ENABLE_DEBUG_METRICS)
+    // 3-3. 초경량 JSON 실시간 성능 계측 API (/api/metrics)
+    server.on("/api/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse(200, "application/json", DebugMonitor::getMetricsJson());
+        response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        response->addHeader("Pragma", "no-cache");
+        request->send(response);
+    });
+
+    server.on("/api/metrics_reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DebugMonitor::resetAllMetrics();
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "OK");
+        response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        request->send(response);
+    });
+
+    // 3-4. 진단 로그 파일 다운로드 (/download_log)
+    server.on("/download_log", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("file")) {
+            String filename = request->getParam("file")->value();
+            if (!filename.startsWith("/")) filename = "/" + filename;
+            if (filename.indexOf("..") < 0 && LittleFS.exists(filename)) {
+                request->send(LittleFS, filename, "text/plain", true);
+                return;
+            }
+        }
+        request->send(404, "text/plain", "File Not Found");
+    });
+#endif
+
     // 4. 클래식 버튼/명령 라우트 (/action)
     server.on("/action", HTTP_GET, [](AsyncWebServerRequest *request) {
         String cmd = request->hasParam("cmd") ? request->getParam("cmd")->value() : "";
@@ -1076,36 +1159,54 @@ void WebManager::begin() {
             MIDISequencer::pause();
         } else if (cmd == "stop") {
             MIDISequencer::stop();
+        } else if (cmd == "delete_log" && request->hasParam("file")) {
+            String fileName = request->getParam("file")->value();
+            if (fileName.indexOf("..") < 0) {
+                if (!fileName.startsWith("/")) fileName = "/" + fileName;
+                if (LittleFS.exists(fileName)) {
+                    LittleFS.remove(fileName);
+                }
+            }
+            tab = "debug";
         } else if (cmd == "play_midi" && request->hasParam("file")) {
             DisplayUI::onExternalMIDIActivity(); // 게임 중이면 게임 즉시 종료 후 메인화면으로 복귀하여 재생
-            String path = "/" + request->getParam("file")->value();
-            MIDISequencer::loadFile(path.c_str());
-            MIDISequencer::play();
+            String fileName = request->getParam("file")->value();
+            if (fileName.indexOf("..") < 0) {
+                String path = "/" + fileName;
+                MIDISequencer::loadFile(path.c_str());
+                MIDISequencer::play();
+            }
         } else if (cmd == "delete_midi" && request->hasParam("file")) {
             String fileName = request->getParam("file")->value();
-            if (fileName == MIDISequencer::getCurrentSongName() && !isGameActive) {
-                MIDISequencer::stop();
+            if (fileName.indexOf("..") < 0) {
+                if (fileName == MIDISequencer::getCurrentSongName() && !isGameActive) {
+                    MIDISequencer::stop();
+                }
+                String path = "/" + fileName;
+                LittleFS.remove(path.c_str());
+                DisplayUI::invalidateFileListCache();
             }
-            String path = "/" + fileName;
-            LittleFS.remove(path.c_str());
-            DisplayUI::invalidateFileListCache();
             tab = "player";
         } else if (cmd == "select_font" && request->hasParam("name")) {
             if (MIDISequencer::getState() == SEQ_PLAYING || AudioEngine::getActiveVoiceCount() > 0) {
                 DisplayUI::showToast(DisplayUI::isKoreanMode() ? "먼저 재생을 멈추십시오!" : "Stop Music First!", 2000);
             } else {
                 String fontName = request->getParam("name")->value();
-                String path = fontName.startsWith("/") ? fontName : ("/" + fontName);
-                AudioEngine::loadSoundFontAsync(path.c_str());
+                if (fontName.indexOf("..") < 0) {
+                    String path = fontName.startsWith("/") ? fontName : ("/" + fontName);
+                    AudioEngine::loadSoundFontAsync(path.c_str());
+                }
             }
         } else if (cmd == "delete_font" && request->hasParam("name")) {
             String fontName = request->getParam("name")->value();
-            if (fontName.indexOf("CT4MGM") >= 0 || fontName.indexOf("ct4mgm") >= 0) {
-                DisplayUI::showToast(DisplayUI::isKoreanMode() ? "기본 폰트는 삭제 불가!" : "Core Font Protected!");
-            } else {
-                String path = "/" + fontName;
-                LittleFS.remove(path.c_str());
-                DisplayUI::invalidateFileListCache();
+            if (fontName.indexOf("..") < 0) {
+                if (fontName.indexOf("CT4MGM") >= 0 || fontName.indexOf("ct4mgm") >= 0) {
+                    DisplayUI::showToast(DisplayUI::isKoreanMode() ? "기본 폰트는 삭제 불가!" : "Core Font Protected!");
+                } else {
+                    String path = "/" + fontName;
+                    LittleFS.remove(path.c_str());
+                    DisplayUI::invalidateFileListCache();
+                }
             }
             tab = "fonts";
         } else if (cmd == "set_font_mgmt" && request->hasParam("font_mgmt_en")) {
@@ -1144,6 +1245,20 @@ void WebManager::begin() {
             if (sscanf(dt.c_str(), "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) >= 5) {
                 TimeManager::setManualTime(yr, mo, dy, hr, mn, sc);
                 DisplayUI::showToast(DisplayUI::isKoreanMode() ? "시간 설정 완료!" : "Time Set!");
+            }
+            tab = "settings";
+        } else if (cmd == "set_synth_policy") {
+            bool isPlaying = (MIDISequencer::getState() == SEQ_PLAYING) || MIDIParser::isMIDIActive();
+            if (isPlaying) {
+                DisplayUI::showToast(DisplayUI::isKoreanMode() ? "재생중 모드 변경 불가" : "Playing: Locked", 1500);
+            } else if (request->hasParam("policy")) {
+                uint8_t pol = request->getParam("policy")->value().toInt();
+                MIDIParser::setSynthPolicy((SynthPolicy)pol, true);
+                if (pol == 1 && request->hasParam("manual_sub")) {
+                    uint8_t sub = request->getParam("manual_sub")->value().toInt();
+                    MIDIParser::setManualSubMode((ManualSubMode)sub, true);
+                }
+                DisplayUI::showToast(DisplayUI::isKoreanMode() ? "모드 설정 저장 완료!" : "Synth Mode Saved!");
             }
             tab = "settings";
         } else if (cmd == "panic") {

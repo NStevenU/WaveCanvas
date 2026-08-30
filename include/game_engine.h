@@ -119,5 +119,5 @@ private:
         bool active;
     };
     static SFXSlot sfxSlots[4];
-    static void play8BitSound(uint8_t note, uint16_t durationMs, uint8_t program = 80, uint8_t ch = 0, uint8_t vel = 90);
+    static void play8BitSound(uint8_t note, uint16_t durationMs, uint8_t program = 80, uint8_t ch = 15, uint8_t vel = 90);
 };
