@@ -832,6 +832,8 @@ void MIDISequencer::update() {
         // 원샷 초고속 일괄 락 (Batch Lock) & 틱 유실 없는 분할 처리:
         SemaphoreHandle_t mutex = AudioEngine::getMutex();
         if (mutex && xSemaphoreTake(mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            // Preserve ordering between live MIDI events and sequencer events.
+            AudioEngine::processQueuedMidiEventsLocked();
             while (ticksToAdvance > 0 && state == SEQ_PLAYING) {
                 uint32_t step = (ticksToAdvance > 30) ? 30 : ticksToAdvance;
                 for (uint32_t i = 0; i < step; i++) {

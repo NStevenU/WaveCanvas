@@ -16,6 +16,9 @@ public:
     static void programChange(uint8_t channel, uint8_t program);
     static void controlChange(uint8_t channel, uint8_t controller, uint8_t value);
     static void pitchBend(uint8_t channel, uint16_t value);
+    static uint32_t getMidiQueueOverflowCount();
+    // Must be called while holding getMutex(), before direct MIDI dispatch.
+    static void processQueuedMidiEventsLocked();
     static void panic(); // All Sound Off
     static void systemReset(); // GM / GS System Reset
     

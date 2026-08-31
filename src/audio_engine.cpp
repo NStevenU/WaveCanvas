@@ -15,6 +15,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include "esp_heap_caps.h"
 
 // TSF PSRAM 메모리 할당 매핑 (8MB Octal PSRAM)
@@ -38,6 +39,62 @@ static inline void* tsf_psram_realloc(void* ptr, size_t size) {
 
 static tsf* g_tsf = nullptr;
 static SemaphoreHandle_t g_tsf_mutex = nullptr;
+static QueueHandle_t g_midi_event_queue = nullptr;
+static volatile uint32_t g_midi_queue_overflows = 0;
+
+// This queue is deliberately large enough for a burst of UART/SysEx-generated
+// MIDI while the audio task is rendering a block.
+static constexpr UBaseType_t MIDI_EVENT_QUEUE_LENGTH = 1024;
+enum class MidiEventType : uint8_t {
+    NoteOn,
+    NoteOff,
+    ProgramChange,
+    ControlChange,
+    PitchBend
+};
+struct MidiEvent {
+    MidiEventType type;
+    uint8_t channel;
+    uint8_t data1;
+    uint8_t data2;
+    uint16_t value;
+};
+
+static void recordMidiQueueOverflow() {
+    __atomic_add_fetch(&g_midi_queue_overflows, 1, __ATOMIC_RELAXED);
+}
+
+static void enqueueMidiEvent(const MidiEvent& event) {
+    if (!g_midi_event_queue ||
+        xQueueSend(g_midi_event_queue, &event, 0) != pdTRUE) {
+        recordMidiQueueOverflow();
+    }
+}
+
+void AudioEngine::processQueuedMidiEventsLocked() {
+    if (!g_midi_event_queue) return;
+
+    MidiEvent event;
+    while (xQueueReceive(g_midi_event_queue, &event, 0) == pdTRUE) {
+        switch (event.type) {
+            case MidiEventType::NoteOn:
+                AudioEngine::noteOnDirect(event.channel, event.data1, event.data2);
+                break;
+            case MidiEventType::NoteOff:
+                AudioEngine::noteOffDirect(event.channel, event.data1);
+                break;
+            case MidiEventType::ProgramChange:
+                AudioEngine::programChangeDirect(event.channel, event.data1);
+                break;
+            case MidiEventType::ControlChange:
+                AudioEngine::controlChangeDirect(event.channel, event.data1, event.data2);
+                break;
+            case MidiEventType::PitchBend:
+                AudioEngine::pitchBendDirect(event.channel, event.value);
+                break;
+        }
+    }
+}
 static uint8_t g_master_volume = 85;
 static bool g_is_mono_mode = false;
 static bool g_hw_mono_detected = false;
@@ -361,6 +418,10 @@ void AudioEngine::audioTask(void* parameter) {
             if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 t_mutex_acquired = esp_timer_get_time();
 
+                // MIDI producers only enqueue; apply events here so the
+                // synthesizer is always accessed under its mutex.
+                processQueuedMidiEventsLocked();
+
                 t_tsf_start = t_mutex_acquired;
                 tsf_render_float(g_tsf, g_audio_float_buffer, AUDIO_BUFFER_SIZE, 0);
                 t_tsf_end = esp_timer_get_time();
@@ -456,8 +517,18 @@ bool AudioEngine::begin() {
     if (!g_tsf_mutex) {
         return false;
     }
+    g_midi_event_queue = xQueueCreate(MIDI_EVENT_QUEUE_LENGTH, sizeof(MidiEvent));
+    if (!g_midi_event_queue) {
+        vSemaphoreDelete(g_tsf_mutex);
+        g_tsf_mutex = nullptr;
+        return false;
+    }
 
     if (!initI2S()) {
+        vQueueDelete(g_midi_event_queue);
+        g_midi_event_queue = nullptr;
+        vSemaphoreDelete(g_tsf_mutex);
+        g_tsf_mutex = nullptr;
         return false;
     }
 
@@ -474,6 +545,10 @@ bool AudioEngine::begin() {
     );
 
     if (res != pdPASS) {
+        vQueueDelete(g_midi_event_queue);
+        g_midi_event_queue = nullptr;
+        vSemaphoreDelete(g_tsf_mutex);
+        g_tsf_mutex = nullptr;
         return false;
     }
     DEBUG_REG_AUDIO_TASK(hAud);
@@ -483,43 +558,27 @@ bool AudioEngine::begin() {
 
 // MIDI 메시지 처리
 void AudioEngine::noteOn(uint8_t channel, uint8_t key, uint8_t velocity) {
-    if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        noteOnDirect(channel, key, velocity);
-        xSemaphoreGive(g_tsf_mutex);
-    }
+    enqueueMidiEvent({MidiEventType::NoteOn, channel, key, velocity, 0});
 }
 
 void AudioEngine::noteOff(uint8_t channel, uint8_t key) {
-    if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        noteOffDirect(channel, key);
-        xSemaphoreGive(g_tsf_mutex);
-    }
+    enqueueMidiEvent({MidiEventType::NoteOff, channel, key, 0, 0});
 }
 
 void AudioEngine::programChange(uint8_t channel, uint8_t program) {
-    if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        programChangeDirect(channel, program);
-        xSemaphoreGive(g_tsf_mutex);
-    }
+    enqueueMidiEvent({MidiEventType::ProgramChange, channel, program, 0, 0});
 }
 
 void AudioEngine::controlChange(uint8_t channel, uint8_t controller, uint8_t value) {
-    if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        tsf_channel_midi_control(g_tsf, channel, controller, value);
-        xSemaphoreGive(g_tsf_mutex);
-    }
+    enqueueMidiEvent({MidiEventType::ControlChange, channel, controller, value, 0});
 }
 
 void AudioEngine::pitchBend(uint8_t channel, uint16_t value) {
-    if (!g_tsf || !g_tsf_mutex) return;
-    if (xSemaphoreTake(g_tsf_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        tsf_channel_set_pitchwheel(g_tsf, channel, (int)value);
-        xSemaphoreGive(g_tsf_mutex);
-    }
+    enqueueMidiEvent({MidiEventType::PitchBend, channel, 0, 0, value});
+}
+
+uint32_t AudioEngine::getMidiQueueOverflowCount() {
+    return __atomic_load_n(&g_midi_queue_overflows, __ATOMIC_RELAXED);
 }
 
 SemaphoreHandle_t AudioEngine::getMutex() {
@@ -759,6 +818,7 @@ void AudioEngine::setChannelDrumMode(uint8_t channel, bool isDrum) {
 }
 
 void AudioEngine::panicDirect() {
+    if (g_midi_event_queue) xQueueReset(g_midi_event_queue);
     LA32SynthEngine::reset();
     if (!g_tsf) return;
     tsf_channel_sounds_off_all(g_tsf, -1); // 모든 채널/보이스 즉시 강제 킬
@@ -781,6 +841,7 @@ void AudioEngine::panic() {
 }
 
 void AudioEngine::systemResetDirect() {
+    if (g_midi_event_queue) xQueueReset(g_midi_event_queue);
     LA32SynthEngine::reset();
     resetMT32FilterDirect();
     s_silenceFrames = 0;

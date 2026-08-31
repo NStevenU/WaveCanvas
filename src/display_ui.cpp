@@ -55,6 +55,9 @@ bool DisplayUI::isFontManagementEnabled() { return fontManagementEnabled; }
 void DisplayUI::onExternalMIDIActivity() {
   wakeup();
   lastActivityTime = millis();
+  if (MIDISequencer::getState() == SEQ_PLAYING) {
+    MIDISequencer::stop();
+  }
   if (currentMode == SCREEN_GAME_RUNNING || currentMode == SCREEN_MENU_GAMES) {
     GameEngine::exitGame();
     AudioEngine::systemReset();

@@ -388,6 +388,10 @@ static void serialMidiTask(void* pv) {
     while (true) {
         int avail = SerialMIDI.available();
         if (avail > 0) {
+            if (MIDISequencer::getState() == SEQ_PLAYING) {
+                MIDISequencer::stop();
+                DisplayUI::onExternalMIDIActivity();
+            }
             int toRead = (avail > (int)sizeof(rxBuf)) ? (int)sizeof(rxBuf) : avail;
             int count = SerialMIDI.readBytes(rxBuf, toRead);
             for (int i = 0; i < count; i++) {
